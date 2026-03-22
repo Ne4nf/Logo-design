@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package logo_agent.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Contract aligned to simplified 8-step POC flow.
+
+message StartSessionRequest {
+  string session_id = 1;
+  string user_prompt = 2;
+}
+
+message StartSessionResponse {
+  string session_id = 1;
+  bool needs_clarification = 2;
+  repeated string clarification_questions = 3;
+  BrandContext brand_context = 4;
+}
+
+message ClarificationRequest {
+  string session_id = 1;
+  repeated string answers = 2;
+  bool skip = 3;
+}
+
+message ClarificationResponse {
+  string session_id = 1;
+  BrandContext brand_context = 2;
+  repeated string assumptions = 3;
+}
+
+message GenerateLogosRequest {
+  string session_id = 1;
+  BrandContext brand_context = 2;
+}
+
+message GenerateLogosStreamChunk {
+  enum ChunkType {
+    CHUNK_UNSPECIFIED = 0;
+    CHUNK_REASONING = 1;
+    CHUNK_FINAL = 2;
+    CHUNK_ERROR = 3;
+  }
+
+  ChunkType chunk_type = 1;
+  ReasoningBlock reasoning = 2;
+  DesignGuideline guideline = 3;
+  repeated LogoOption logos = 4;
+  ErrorInfo error = 5;
+  bool is_final = 6;
+}
+
+message SelectLogoRequest {
+  string session_id = 1;
+  string logo_id = 2;
+}
+
+message SelectLogoResponse {
+  string session_id = 1;
+  string selected_logo_id = 2;
+  google.protobuf.Timestamp selected_at = 3;
+}
+
+message EditLogoRequest {
+  string session_id = 1;
+  string selected_logo_id = 2;
+  string edit_prompt = 3;
+}
+
+message EditLogoResponse {
+  string session_id = 1;
+  string selected_logo_id = 2;
+  LogoOption updated_logo = 3;
+  repeated string edit_summary = 4;
+  repeated string assumptions = 5;
+  google.protobuf.Timestamp generated_at = 6;
+}
+
+message GetTaskStatusRequest {
+  string task_id = 1;
+}
+
+message GetTaskStatusResponse {
+  string task_id = 1;
+  string status = 2;
+  string task_type = 3;
+  ErrorInfo error = 4;
+}
+
+// Domain entities
+
+message BrandContext {
+  string brand_name = 1;
+  string industry = 2;
+  repeated string style_intent = 3;
+  repeated string core_values = 4;
+  string target_audience = 5;
+  repeated string assumptions = 6;
+}
+
+message ReasoningBlock {
+  enum ReasoningStage {
+    STAGE_UNSPECIFIED = 0;
+    STAGE_INPUT_UNDERSTANDING = 1;
+    STAGE_STYLE_INFERENCE = 2;
+    STAGE_DONE = 3;
+  }
+  ReasoningStage stage = 1;
+  string title = 2;
+  repeated string bullets = 3;
+}
+
+message DesignGuideline {
+  string guideline_id = 1;
+  string summary = 2;
+  string prompt_basis = 3;
+  repeated string visual_direction = 4;
+  string typography_notes = 5;
+  repeated string assumptions = 6;
+}
+
+message LogoOption {
+  string logo_id = 1;
+  string session_id = 2;
+  string image_url = 3;
+  string model_provider = 4;
+  string generated_from_guideline_id = 5;
+  google.protobuf.Timestamp generated_at = 6;
+}
+
+message ErrorInfo {
+  string code = 1;
+  string message = 2;
+  repeated string retry_suggestions = 3;
+}
+
+service LogoDesignAgent {
+  rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+  rpc SubmitClarification(ClarificationRequest) returns (ClarificationResponse);
+  rpc GenerateLogos(GenerateLogosRequest) returns (stream GenerateLogosStreamChunk);
+  rpc SelectLogo(SelectLogoRequest) returns (SelectLogoResponse);
+  rpc EditLogo(EditLogoRequest) returns (EditLogoResponse);
+  rpc GetTaskStatus(GetTaskStatusRequest) returns (GetTaskStatusResponse);
+}

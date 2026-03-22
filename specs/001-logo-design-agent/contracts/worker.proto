@@ -1,0 +1,98 @@
+syntax = "proto3";
+
+package logo_agent.workers.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Worker contract aligned to simplified POC.
+
+message AnalyzeRequestInput {
+  string session_id = 1;
+  string user_prompt = 2;
+}
+
+message AnalyzeRequestOutput {
+  string session_id = 1;
+  bool needs_clarification = 2;
+  repeated string clarification_questions = 3;
+  string brand_name = 4;
+  string industry = 5;
+  repeated string style_intent = 6;
+  repeated string assumptions = 7;
+  google.protobuf.Timestamp completed_at = 8;
+}
+
+message StreamReasoningInput {
+  string session_id = 1;
+  string brand_name = 2;
+  string industry = 3;
+  repeated string style_intent = 4;
+}
+
+message StreamReasoningChunk {
+  enum Stage {
+    STAGE_UNSPECIFIED = 0;
+    STAGE_INPUT_UNDERSTANDING = 1;
+    STAGE_STYLE_INFERENCE = 2;
+    STAGE_DONE = 3;
+  }
+  Stage stage = 1;
+  string title = 2;
+  repeated string bullets = 3;
+}
+
+message GenerateLogosInput {
+  string session_id = 1;
+  string guideline_summary = 2;
+  string prompt_basis = 3;
+  repeated string visual_direction = 4;
+  string typography_notes = 5;
+  int32 num_logos = 6; // 3-4
+}
+
+message GenerateLogosOutput {
+  string session_id = 1;
+  string guideline_id = 2;
+  repeated GeneratedLogo logos = 3;
+  google.protobuf.Timestamp completed_at = 4;
+}
+
+message GeneratedLogo {
+  string logo_id = 1;
+  string image_url = 2;
+  string model_provider = 3;
+  google.protobuf.Timestamp generated_at = 4;
+}
+
+message SelectLogoInput {
+  string session_id = 1;
+  string logo_id = 2;
+}
+
+message SelectLogoOutput {
+  string session_id = 1;
+  string selected_logo_id = 2;
+  google.protobuf.Timestamp selected_at = 3;
+}
+
+message EditLogoInput {
+  string session_id = 2;
+  string selected_logo_id = 3;
+  string edit_prompt = 4;
+}
+
+message EditLogoOutput {
+  string session_id = 1;
+  string selected_logo_id = 2;
+  GeneratedLogo updated_logo = 3;
+  repeated string edit_summary = 4;
+  google.protobuf.Timestamp completed_at = 5;
+}
+
+message WorkerTaskStatus {
+  string task_id = 1;
+  string task_type = 2;
+  string status = 3; // pending | processing | completed | failed
+  string error_message = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}

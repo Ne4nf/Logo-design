@@ -1,20 +1,20 @@
 # Technical Design Document (TDD)
 
-Feature: AI Logo Design Agent  
+Feature: AI Logo Design Agent (POC Phase 1)  
 Branch: 001-logo-design-agent  
-Date: 2026-03-21  
-Status: Implementation-ready
+Date: 2026-03-22  
+Status: Implementation-ready (POC-aligned, scope-controlled)
 
 ## 1. Purpose and Scope
 
 This document translates the product spec and architecture into an implementation-ready system design using ai-hub-sdk.
 
 Objectives:
-- Define end-to-end workflow logic (agent pipeline) aligned with FR-001..FR-014.
+- Define end-to-end workflow logic (agent pipeline) aligned with FR-001..FR-014, **strictly bounded by POC scope constraints**.
 - Define Pydantic data schemas for task I/O and session state.
-- Define orchestrator design for conditional branching, retries, defaults, and multi-turn flow.
-- Define frontend stack and API interaction model.
-- Clearly separate POC scope from deferred scope.
+- Define orchestrator design for conditional branching, retries, and multi-turn flow (without drafting or auto-selection).
+- Define frontend stack and API interaction model for text-only reasoning and prompt-based editing.
+- **Enforce POC scope**: No drafting pattern (NFR-007), no touch edit/smart mark (NFR-006), no multi-model routing (NFR-005), no timeout auto-selection (keeps UX explicit and simple).
 
 ## 2. Design Principles
 
@@ -78,17 +78,21 @@ graph TD
 
 ## 5.1 Pipeline states
 
-Session state machine:
-- NEW
-- NEEDS_CLARIFICATION
-- REASONING
-- DRAFTING_OPTIONAL
-- AWAIT_DIRECTION_SELECTION
-- HQ_RENDERING
-- AWAIT_EDIT
-- EDIT_RENDERING
-- COMPLETED
-- FAILED
+Session state machine (simplified, 7 states for POC clarity):
+- NEW: Session initialized, awaiting user prompt
+- NEEDS_CLARIFICATION: Missing required context, asking follow-up questions
+- REASONING: Processing brand context and emitting reasoning chunks before generation
+- GENERATING: HQ logo generation in progress (single-model, 3-4 outputs)
+- AWAITING_SELECTION: Generated logos displayed, user must select one
+- EDITING: User-selected logo sent for prompt-based edit regeneration
+- COMPLETED: Flow finished, final output delivered or error resolved
+
+**Removed states** (out of POC scope):
+- ❌ DRAFTING_OPTIONAL (no drafting pattern per NFR-007)
+- ❌ AWAIT_DIRECTION_SELECTION (no direction selector per simplified UX)
+- ❌ HQ_RENDERING (implicit within GENERATING)
+- ❌ EDIT_RENDERING (implicit within EDITING)
+- ❌ FAILED as separate state (errors transition to COMPLETED with failure details)
 
 ## 5.2 Main flow
 
@@ -115,42 +119,47 @@ sequenceDiagram
 
     OR->>SS: Start reasoning stream
     SS-->>FE: Input Understanding
-    SS-->>FE: Image Reference Analysis
     SS-->>FE: Style Inference
-    SS-->>FE: Reference Exploration
+    SS-->>FE: (Optional) Image Reference Analysis if reference image provided
 
-    alt prompt is specific
-        OR->>AG: submit HQ generation async task
-    else prompt is ambiguous
-        OR->>AG: submit draft generation async task
-        AG-->>FE: 3-4 draft concepts
-        alt user selects direction
-            FE->>OR: selected direction
-        else timeout or skip
-            OR->>OR: auto-select first direction (default)
-        end
-        OR->>AG: submit HQ generation async task
-    end
+    Note over OR,AG: Single-step HQ generation (no drafting per NFR-007)
+    OR->>AG: submit HQ logo generation async task (3-4 outputs, single model selection)
 
     AG-->>FE: webhook status completed/failed
     FE->>OR: fetch task status
-    OR-->>FE: final logos + rationale + quick actions
+    OR-->>FE: final 3-4 logos + design rationale
+    
+    FE-->>U: Display logos and prompt user: "Select one logo to edit, or confirm final choice"
+    U->>FE: Select logo + (optional) provide edit prompt
+    alt user provides edit prompt
+        FE->>OR: POST /logo/sessions/{session_id}/edit with selected_logo_id and edit_command
+        OR->>AG: submit edit regeneration task (prompt-based only, no mask)
+        AG-->>FE: webhook with edited logo
+    else user confirms
+        FE->>OR: Mark session as completed
+    end
 ```
 
-## 5.3 Routing rules
+## 5.3 Single-Model Selection (Not Multi-Model Routing)
 
-Model routing decision (inside generation task):
-- Rule A: text-heavy logo request -> DALL-E 3 or Ideogram.
-- Rule B: abstract/artistic request -> Midjourney or Imagen.
-- Rule C: regional edit request -> Stable Diffusion Inpainting.
-- Rule D: if model/tool failure -> stop and return explicit retry guidance.
+**POC Constraint** (NFR-005): Single model generation selected once per session, not dynamically per request.
 
-## 5.4 Default behavior and edge rules
+**Selection Logic** (deterministic, chosen at session start by orchestrator based on brand context):
+- **Default Model**: DALL-E 3 (strong text rendering, consistent quality, broad style range)
+- **Alternative** (if explicitly requested in future, not POC): Ideogram (superior design consistency)
 
-- If user skips clarification: continue with defaults and persist assumptions.
-- If user does not choose design direction in timeout window: choose direction[0].
-- If no brand name: generate symbol-first concept with placeholder naming notes.
-- If conflicting style constraints: choose dominant style and explain assumption.
+**Not implemented in POC**:
+- ❌ Rule B: abstract/artistic routing to Midjourney/Imagen (single model only)
+- ❌ Rule C: regional edit with inpainting (prompt-based edit only, NFR-006 out of scope)
+- ❌ Multi-threading: parallel requests to multiple models for A/B comparison
+- ❌ Router logic: LLM-based model selection per request (fixed model per session)
+
+## 5.4 Assumptions & Edge Cases (Simplified for POC)
+
+- **If user skips clarification**: Continue with documented assumptions (FR-013). System persists assumption list and surfaces before generation (NFR-003).
+- **If no brand name provided**: Generate symbol-focused concept with note to user (edge case, acceptable)
+- **If conflicting style constraints**: Choose dominant constraint and explain reasoning in stream output
+- **❌ Removed (POC simplicity)**: No timeout-based auto-default direction selection. User experiences linear, explicit flow without timeouts or automata.
 
 ## 6. Orchestrator Design
 
@@ -169,33 +178,38 @@ Worker task responsibilities:
 - Validate and normalize task output.
 - Emit metadata and traces.
 
-## 6.2 Task split and serving mode
+## 6.2 Task Catalog (POC-Aligned, Single-Model)
 
-Recommended task catalog:
+**Only 4 core tasks** (no drafting or multi-model):
 
-1. logo_intent_check_task
-- ServingMode.SYNC
-- Purpose: detect logo intent + parse initial context quickly.
+1. **logo_intent_check_task**
+   - ServingMode: SYNC
+   - Purpose: Detect logo intent (FR-001), extract brand context (FR-002)
+   - Input: user prompt (+ optional reference image)
+   - Output: normalized BrandContext, confidence score
 
-2. logo_reasoning_stream_task
-- ServingMode.STREAM
-- Purpose: emit FR-005a reasoning chunks before generation.
+2. **logo_reasoning_stream_task**
+   - ServingMode: STREAM
+   - Purpose: Emit reasoning chunks before generation (FR-005): Input Understanding, [Image Reference Analysis if image], Style Inference
+   - Input: BrandContext, clarification answers (if any)
+   - Output: Stream of ReasoningBlock chunks
 
-3. logo_generate_draft_task
-- ServingMode.ASYNC
-- Purpose: create 3-4 low-latency concept drafts.
+3. **logo_generate_hq_task**
+   - ServingMode: ASYNC
+   - Purpose: Generate exactly 3-4 high-quality logos using single selected model (FR-007), produce design guideline (FR-006)
+   - Input: BrandContext, ReasoningOutput, selected model ID
+   - Output: [LogoAsset, LogoAsset, LogoAsset, LogoAsset], DesignGuideline, quality metadata
 
-4. logo_generate_hq_task
-- ServingMode.ASYNC
-- Purpose: create 3-4 high-quality logos for chosen direction.
+4. **logo_edit_task**
+   - ServingMode: ASYNC
+   - Purpose: Regenerate selected logo with prompt-based edit (FR-010), no inpainting mask (NFR-006)
+   - Input: selected LogoAsset ID, edit_command (text prompt)
+   - Output: updated LogoAsset, brief edit_summary
 
-5. logo_edit_task
-- ServingMode.ASYNC
-- Purpose: localized edit using source image + mask + prompt.
-
-6. logo_auto_evaluate_task
-- ServingMode.ASYNC or INTERNAL_ONLY
-- Purpose: LLM-as-judge scoring and quality metadata.
+**❌ Tasks NOT in POC**:
+- logo_generate_draft_task (drafting pattern out of scope, NFR-007)
+- logo_auto_evaluate_task (evaluation deferred, NFR-007)
+- logo_mask_segmentation_task (SAM smart mark out of scope, NFR-006)
 
 ## 6.3 Orchestrator pseudocode
 
@@ -203,31 +217,30 @@ Recommended task catalog:
 async def start_logo_flow(session_id: str, req: StartLogoRequest) -> StartLogoResponse:
     state = await session_repo.get_or_create(session_id)
 
+    # 1. Sync check intent & context
     parsed = await sync_client.compute(task_type="logo_intent_check_task", input_args=req.model_dump())
     ensure_logo_intent(parsed)
 
+    # 2. Clarification branching
     if parsed.result["needs_clarification"]:
         return StartLogoResponse(next_action="clarify", clarification_questions=parsed.result["questions"])
 
+    # 3. Stream reasoning chunks to UI
     stream_id = await stream_client.stream(task_type="logo_reasoning_stream_task", input_args={
         "session_id": session_id,
         "brand_context": parsed.result["brand_context"],
         "reference_image": req.reference_image,
     })
 
-    if parsed.result["is_specific_prompt"]:
-        task_id = await async_client.submit_task(task_type="logo_generate_hq_task", input_args={
-            "session_id": session_id,
-            "direction": parsed.result["resolved_direction"],
-            "brand_context": parsed.result["brand_context"],
-        })
-        return StartLogoResponse(next_action="wait_hq", task_id=task_id, stream_id=stream_id)
-
-    draft_task_id = await async_client.submit_task(task_type="logo_generate_draft_task", input_args={
+    # 4. Async submit HQ Generation (Bỏ qua hoàn toàn Draft)
+    task_id = await async_client.submit_task(task_type="logo_generate_hq_task", input_args={
         "session_id": session_id,
+        "direction": parsed.result["resolved_direction"],
         "brand_context": parsed.result["brand_context"],
+        "webhook_url": req.webhook_url # Lưu ý truyền webhook URL cho SDK
     })
-    return StartLogoResponse(next_action="wait_draft", task_id=draft_task_id, stream_id=stream_id)
+    
+    return StartLogoResponse(next_action="wait_hq", task_id=task_id, stream_id=stream_id)
 ```
 
 ## 7. Data Schema (Pydantic)
@@ -369,88 +382,134 @@ Redis key strategy:
 
 ## 8. Frontend Stack Proposal
 
-## 8.1 Recommended stack
+## 8.1 Recommended Stack (Simplified for POC)
 
-- Framework: Next.js (App Router) + TypeScript.
-- UI: Tailwind CSS + shadcn/ui.
-- State and API caching: TanStack Query.
-- Real-time stream:
-  - Primary: gRPC-web stream bridge or NDJSON HTTP stream.
-  - Fallback: Server-Sent Events.
-- Canvas editing:
-  - React + Konva for overlay and region mask interactions.
-  - Optional SAM-assisted edge selection service.
-- Form/schema:
-  - React Hook Form + Zod for request validation.
+- **Framework**: Next.js (App Router) + TypeScript
+- **UI Components**: Tailwind CSS + shadcn/ui
+- **State & API Caching**: TanStack Query (React Query)
+- **Real-time Reasoning Stream**:
+  - Primary: gRPC-web stream bridge or NDJSON HTTP stream
+  - Fallback: Server-Sent Events (SSE)
+- **Form Validation**: React Hook Form + Zod
 
-## 8.2 Frontend modules
+**❌ NOT in POC** (deferred to Phase 2):
+- ❌ Canvas editing (React + Konva) - no touch edit
+- ❌ SAM local edge detection - no smart mark UI
+- ❌ Region mask interaction tools - scope simplification
 
-- ChatPanel: prompt input, reasoning blocks, clarification prompts.
-- DirectionSelector: 3-4 draft cards, explicit select/skip buttons.
-- LogoGallery: HQ outputs with compare mode and quick actions.
-- CanvasEditor: smart region select, brush fallback, edit command input.
-- TaskStatusClient: webhook/SSE status sync and retry actions.
+## 8.2 Frontend Modules (POC Only)
 
-## 8.3 API surface expected by frontend
+**Core Modules**:
+1. **ChatPanel**: Prompt input field, reasoning streaming display, (optional) reference image upload, clarification question handling
+2. **ReasoningDisplay**: Timeline of streamed reasoning blocks (Input Understanding → Style Inference), with latency timestamps
+3. **LogoGallery**: Display 3-4 generated logos in a grid, each with:
+   - Logo thumbnail (1024x1024 or responsive)
+   - Quality badge (passes all 4 quality checks: single_primary_mark, no_unreadable_text, no_severe_pixelation, guideline_consistency)
+   - Plain text design rationale from DesignGuideline
+4. **LogoSelector**: User selects one logo; system remembers selection for edit flow
+5. **EditPromptInput**: Text field for edit command when user wants to modify selected logo (e.g., "change bird wing to blue")
+6. **TaskStatusClient**: Webhook listener + SSE fallback for async task completion notifications
 
-- POST /api/logo/sessions/{session_id}/start
-- POST /api/logo/sessions/{session_id}/clarify
-- POST /api/logo/sessions/{session_id}/direction/select
-- POST /api/logo/sessions/{session_id}/direction/auto-default
-- POST /api/logo/sessions/{session_id}/edit
-- GET /api/logo/tasks/{task_id}/status
-- GET /api/logo/sessions/{session_id}
+**❌ NOT in POC**:
+- ❌ DirectionSelector (no drafting, no direction choice)
+- ❌ CanvasEditor (no touch edit, no SAM smart mark)
+- ❌ QuickActionsButtons (no AI-suggested quick edits)
+
+## 8.3 API Surface (POC-Minimal)
+
+**Required Endpoints**:
+1. `POST /api/logo/sessions/{session_id}/start`
+   - Input: prompt (text), reference_image_url (optional)
+   - Output: task_id, stream_id for reasoning, clarification_questions (if needed)
+
+2. `POST /api/logo/sessions/{session_id}/clarify`
+   - Input: clarification_answers (dict) or skip=true
+   - Output: reasoning stream started, generation task submitted
+
+3. `POST /api/logo/sessions/{session_id}/edit`
+   - Input: selected_logo_id, edit_command (text prompt)
+   - Output: edit task_id, webhook notification on completion
+
+4. `GET /api/logo/sessions/{session_id}`
+   - Output: current session state, current phase, last generated logos
+
+5. `GET /api/logo/tasks/{task_id}/status`
+   - Output: task status, result (if completed), error (if failed)
+
+**❌ NOT in POC**:
+- ❌ POST /api/logo/sessions/{session_id}/direction/select (no drafting, no direction choosing)
+- ❌ POST /api/logo/sessions/{session_id}/direction/auto-default (no timeout auto-selection)
+- ❌ POST /api/logo/sessions/{session_id}/mask-upload (no inpainting in POC)
 
 ## 9. POC Scope (Build vs Defer)
 
 ## 9.1 Build in POC
 
-Must build now:
-1. Intent detection and brand context extraction.
-2. Conditional clarification flow and skip behavior.
-3. Reasoning stream (4 stages) before generation.
-4. Conditional drafting pattern:
-   - specific prompt -> skip draft
-   - ambiguous prompt -> 3-4 drafts + direction selection
-   - timeout -> auto-select first direction
-5. HQ logo generation with routing rule set (text-heavy, artistic, edit).
-6. Edit flow with mask-based inpainting (manual mask upload or simple brush mask).
-7. Transparent failure messages + retry suggestions.
-8. Redis session state and async task status integration.
-9. Node-level tracing to Langfuse.
+**Core Features** (aligned with spec FR-001..FR-014):
 
-## 9.2 Defer after POC
+1. ✅ **Intent detection** (FR-001): Recognize logo design intent from text input
+2. ✅ **Brand context extraction** (FR-002): Parse brand name, industry, style intent from prompt
+3. ✅ **Clarification flow** (FR-003, FR-004): Ask optional clarification if context incomplete; allow user to skip and document assumptions
+4. ✅ **Reasoning stream** (FR-005): Emit structured reasoning blocks before generation (Input Understanding, Style Inference)
+5. ✅ **Single-step HQ generation** (FR-006, FR-007): Generate exactly 3-4 logos using single model selection; output explicit design guideline
+6. ✅ **Logo selection** (FR-008): Require user to select one logo from generated set
+7. ✅ **Prompt-based edit** (FR-009, FR-010): Support text-only edit commands; regenerate selected logo without mask/inpainting
+8. ✅ **Session context** (FR-011): Preserve single-session conversational state via Redis
+9. ✅ **Transparent error handling** (FR-012): Fail-fast with actionable retry guidance
+10. ✅ **Assumption documentation** (FR-013): List assumptions made during skip/defaults; surface before generation
+11. ✅ **PNG quality validation** (FR-014): Verify outputs meet 1024x1024 + 4 quality checks
+12. ✅ **Observability**: Node-level tracing to Langfuse (trace per reasoning, generation, edit call)
 
-Defer to next phase:
-1. Full multi-provider parallel A/B generation for every request.
-2. Advanced SAM auto-segmentation in browser edge runtime.
-3. Persistent cross-visit project history and versioning.
-4. Enterprise governance (RBAC, quotas, audit UI).
-5. Fine-grained cost optimizer and model marketplace strategy.
-6. SVG export pipeline and print-optimized assets.
-7. Fully automated evaluation feedback loop retraining.
+**❌ Explicitly OUT OF POC** (per NFR-005, NFR-006, NFR-007):
+- ❌ Drafting pattern (fast SDXL/Flux previews) → 4-week delivery risk
+- ❌ Touch Edit / Smart Mark / SAM auto-segmentation → canvas complexity
+- ❌ Multi-model routing (DALL-E vs Ideogram vs Midjourney) → integration risk
+- ❌ Timeout auto-selection + direction chooser → UX complexity
+- ❌ Quick actions UI buttons → polish-phase feature
+- ❌ Parallel multi-provider generation → latency + cost unpredictable
 
-## 10. Implementation Plan
+## 9.2 Defer to Phase 2+
 
-Phase 1 (Week 1-2)
-- Implement task schemas and SessionState repository.
-- Implement logo_intent_check_task and logo_reasoning_stream_task.
-- Build API orchestrator endpoints start/clarify/status.
+The following features are **explicitly deferred** and blocked by NFR-005/NFR-006/NFR-007:
 
-Phase 2 (Week 2-3)
-- Implement logo_generate_draft_task and direction selection flow.
-- Implement timeout default selection logic.
-- Wire draft/hq task submission via AIHubAsyncService.
+1. **Drafting Pattern** (NFR-007): Fast SDXL/Flux preview stage + direction selector
+2. **Multi-Model Routing** (NFR-005): Parallel generation across DALL-E 3, Ideogram, Midjourney
+3. **Touch Edit + Smart Mark** (NFR-006): Canvas-based region selection, SAM auto-segmentation, inpainting masks
+4. **Timeout Auto-Selection**: Direction auto-default if no user response (keeps UX simpler and more predictable)
+5. **Quick Actions UI** (quick-edit suggestions): LLM-generated button suggestions per output
+6. **Persistent Project History**: Cross-visit session resumption, version control
+7. **Enterprise Features**: RBAC, quotas, audit trails, cost tracking
+8. **Advanced Export**: SVG pipeline, print-optimized assets, batch operations
+9. **Auto-Evaluation**: LLM-as-judge quality scoring and retraining loops
 
-Phase 3 (Week 3-4)
-- Implement logo_generate_hq_task routing logic.
-- Implement webhook callback handling and frontend status updates.
-- Add quick actions generation.
+## 10. Implementation Plan (4-Week POC)
 
-Phase 4 (Week 4-5)
-- Implement logo_edit_task with inpainting.
-- Add node-level traces and evaluation task.
-- Run end-to-end acceptance tests against SC-001..SC-011 subset for POC.
+### Week 1-2: Foundation
+- ✅ Implement Pydantic schemas (BrandContext, ReasoningBlock, DesignGuideline, LogoOption, SessionState)
+- ✅ Implement logo_intent_check_task (SYNC, detect logo intent + extract brand context)
+- ✅ Implement logo_reasoning_stream_task (STREAM, emit reasoning chunks)
+- ✅ Build API orchestrator: POST /start, POST /clarify, GET /status endpoints
+- ✅ Wire Redis session store and task status manager
+
+### Week 2-3: Generation
+- ✅ Implement logo_generate_hq_task (ASYNC, single-model selection, 3-4 outputs)
+- ✅ Implement DesignGuideline generation from reasoning output
+- ✅ Wire AIHubAsyncService + Pub/Sub task submission
+- ✅ Implement webhook callback handler for task completion
+- ✅ Build frontend: ReasoningDisplay, LogoGallery, LogoSelector, EditPromptInput
+
+### Week 3-4: Edit + Validation
+- ✅ Implement logo_edit_task (ASYNC, prompt-based regeneration, no mask)
+- ✅ Implement quality validation checks (1024x1024, 4 quality checks per FR-014)
+- ✅ Add node-level Langfuse tracing per task
+- ✅ E2E acceptance tests: test SC-001 through SC-006 + edge cases
+- ✅ Quickstart smoke test validation (T026)
+
+**NO PARALLEL ACTIVITIES** (keep scope tight):
+- ❌ No drafting UI scaffolding (no DirectionSelector, no draft generation task)
+- ❌ No canvas/mask implementation (save for Phase 2)
+- ❌ No multi-model comparison logic (single model fixed per session)
+- ❌ No auto-evaluation task (manual review sufficient for POC)
 
 ## 11. Testing Strategy
 
