@@ -55,162 +55,306 @@ Business validation goals:
 
 ## 3. System Architecture
 
-### 3.1 Architecture principles (reusable)
+### 3.1 Overview
 
-- Task-first:
-  - Each business capability is an independent task (`logo_analyze`, `logo_generate`, `logo_edit`).
-  - Routing is based on `task_type`, not endpoint-specific hardcoding.
-- Schema-first:
-  - All contracts are validated with Pydantic.
-  - New inputs are added by extending schemas and task logic, without rewriting core flow.
-- Stream-first:
-  - `POST /internal/v1/tasks/stream` is the default execution path.
-  - Frontend renders by chunk contract, independent of backend internals.
-- Tool abstraction:
-  - Agent uses local tools and MCP tools behind a stable interface.
-  - Providers can be swapped without changing orchestration flow.
+#### 3.1.1 Why this solution
 
-### 3.2 Runtime mapping to ai-hub-sdk
+We chose a **streaming-first, task-based architecture** because:
 
-- Communication service:
-  - Receives REST/gRPC requests and dispatches by `task_type`.
-- Task execution layer:
-  - `BaseTask`, `TaskInputBaseModel`, `TaskOutputBaseModel`.
-  - `ServingMode.STREAM` for the core logo pipeline.
-- Agent/orchestrator layer:
-  - `Agent` + `Orchestrator` for planning, reasoning, and tool calling.
-- Tool layer:
-  - Function tools and MCP tools (HTTP/SSE, timeout, retry, tool filtering).
-- Integration layer:
-  - LLM API, optional vision API, image generation/edit API.
-- Storage/observability:
-  - Object storage/CDN for image assets.
-  - Metadata and tracing for latency, usage, and cost.
+1. **Early visibility** (UX): Emit reasoning and guideline chunks within 1-2s, so users see progress before image generation begins (slow operation).
+2. **Modular reuse**: Each capability (analyze, generate, edit) is a task type that can be called independently or composed.
+3. **Provider agility**: Tool abstraction lets us swap image generators (Nano Banana → other) without touching core orchestration logic.
+4. **Async-ready**: Stream API can later become async (webhook) if frontend drops long-polling.
 
-### 3.3 End-to-end pipeline with clear ownership
+#### 3.1.2 System architecture diagram (Layered)
 
-Stage A - Analyze:
+```mermaid
+graph TB
+    FE["Frontend<br/>(Chat UI)"]
+    API["Communication Layer<br/>(Stream API)"]
+    TASK["Task Execution Layer<br/>(BaseTask + logo_generate/edit)"]
+    ORCH["Orchestrator<br/>(planning + LLM calls)"]
+    TOOLS["Tools Layer<br/>(LLM tool, ImageGen tool)"]
+    GEMINI["Gemini 2.5-flash<br/>(reasoning + guideline)"]
+    NANONA["Nano Banana<br/>(Stable Diffusion 3.5)"]
+    STORAGE["Storage/CDN<br/>(image URLs)"]
 
-- Input: `LogoGenerateInput` (query, references, session_id).
-- Handle:
-  - intent detection
-  - context extraction
-  - clarification decision
-  - assumptions generation if user skips clarification
-- Stream outputs:
-  - `clarification` (optional)
-  - `reasoning`
-  - `guideline`
-
-Stage B - Generate:
-
-- Input: guideline + generation parameters.
-- Handle:
-  - build model prompt from guideline
-  - call image generation provider 3-4 times (or batch)
-  - upload assets to storage
-  - attach metadata (`seed`, `quality_flags`, timing)
-- Stream outputs:
-  - `image_option` x 3-4
-  - `suggestion`
-  - `done`
-
-Stage C - Edit:
-
-- Input: `LogoEditInput` (selected image, edit prompt, guideline).
-- Handle:
-  - parse edit intent
-  - call image edit provider
-  - upload edited result
-  - produce edit summary
-- Stream outputs:
-  - `reasoning`
-  - `edit_result`
-  - `suggestion`
-  - `done`
-
-
-
-### 3.5 Orchestrator execution blueprint
-
-```text
-on_stream_request(task_type, input_args):
-  validate_schema(task_type, input_args)
-  init_request_context(request_id, session_id)
-
-  if task_type == logo_generate:
-    run logo_analyze
-      -> emit clarification/reasoning/guideline
-    run logo_generate
-      -> emit image_option chunks
-      -> emit suggestion + done
-
-  if task_type == logo_edit:
-    run logo_edit
-      -> emit reasoning
-      -> emit edit_result
-      -> emit suggestion + done
-
-  on_error:
-    map_exception_to_error_code
-    emit error chunk (retryable + suggested_action)
+    FE -->|POST /stream| API
+    API -->|dispatch by task_type| TASK
+    TASK -->|delegate| ORCH
+    ORCH -->|call_tool| TOOLS
+    TOOLS -->|text API| GEMINI
+    TOOLS -->|HTTP/MCP| NANONA
+    TOOLS -->|upload| STORAGE
+    STORAGE -->|signed URLs| FE
 ```
 
-### 3.6 Reuse and extensibility (no hard rules)
+#### 3.1.3 System layers & responsibilities
 
-- Add new style outputs:
-  - extend guideline/schema fields, keep endpoint contract unchanged.
-- Add or switch providers:
-  - replace adapter in `ImageGenerationTool` or `ImageEditTool`.
-- Add new capabilities:
-  - register a new `task_type` (for example `logo_variation_regenerate`).
-- Add external integrations:
-  - attach new MCP tools with `tool_filter` for least privilege.
+- **Communication layer** (REST API): Route by `task_type`, validate input schema, stream chunks to client.
+- **Task layer** (ai-hub-sdk): Define `logo_generate` and `logo_edit` as tasks with structured input/output; register with `ServingMode.STREAM`.
+- **Orchestration layer** (Agent + Orchestrator): Call LLM for reasoning/guideline, coordinate tools, emit stream chunks in order.
+- **Tool layer** (Function tools + MCP): Stable abstractions for LLM calls and image generation; support timeout, retry, tool filtering.
+- **Integration layer** (external APIs): **Gemini 2.5-flash** for reasoning, **Nano Banana/Stable Diffusion** for image generation.
+- **Storage layer** (object storage + CDN): Persist images, return signed/public URLs with TTL.
 
-Rule placement strategy:
+---
 
-- Business behavior lives in schema + prompt templates + tool adapters.
-- Communication layer stays generic and reusable.
+### 3.2 Architecture principles & decision rationale
 
-### 3.7 Sequence diagram
+#### 3.2.1 Task-first
+
+- Each business capability is an independent task: `logo_analyze`, `logo_generate`, `logo_edit`.
+- Routing is based on `task_type`, not endpoint-specific hardcoding.
+- **Rationale**: Enables reuse by other features (variation, batch generation, A/B testing) without code duplication; scales to multi-model routing in production.
+
+#### 3.2.2 Schema-first
+
+- All contracts use Pydantic: `LogoGenerateInput`, `DesignGuideline`, `StreamEnvelope`.
+- Validation at boundary (communication layer); schema changes don't require flow rewrites.
+- **Rationale**: Type safety + backward compatibility; new fields = new template logic, not orchestrator changes.
+
+#### 3.2.3 Stream-first
+
+- `POST /internal/v1/tasks/stream` is default execution path.
+- Frontend renders by `chunk_type` from `StreamEnvelope`, respects `sequence` for ordering.
+- **Rationale**: Achieves p95 first reasoning chunk ≤ 1.5s by streaming tokens early; frontend controls rendering independently.
+
+#### 3.2.4 Tool abstraction
+
+- Agent calls tools behind stable interface: `LLMTool`, `ImageGenerationTool`, `ImageEditTool`.
+- Providers swappable: Gemini → Claude, Nano Banana → Imagen 4, without touching orchestrator.
+- **Rationale**: POC agility (test different models); production upgrade path (enhance quality) without rearchitecting.
+
+---
+
+### 3.3 Component breakdown & external service decisions
+
+| Component | Role | External Service | Decision | Cost/Latency | Rationale |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **LLM Tool** (in Orchestrator) | Intent detection, reasoning generation, guideline synthesis | **Gemini 2.5-flash** (streaming) | Text-only input; stream tokens for reasoning chunks | ~$0.50/M input, $2/M output; TTFB ~500ms | Fastest TTFB (<1.5s p95); cost-effective for POC; native streaming for chunk emission |
+| **Vision Tool** (Analyze stage, optional) | Extract style/color/iconography from reference images | Gemini 2.5-flash multimodal OR deferred | Deferred in POC | N/A | Scope reduction; text-based analysis covers 80% of use cases; can add later |
+| **ImageGen Tool** (Generate stage) | Generate 3-4 PNG logos from prompt + guideline | **Nano Banana API** (Stable Diffusion 3.5-turbo) | Batch-capable; HTTP/MCP endpoint | ~$0.01-0.02/image; SLA ~8-12s per image | Affordable POC ($0.04-0.08/request for 4 images); parallel support for 3-4 concurrent; no waiting list |
+| **ImageEdit Tool** (Edit stage) | Regenerate selected logo with edit prompt | **Nano Banana API** (img2img mode) OR reuse generation | Img2img faster than full regenerate | ~$0.015-0.025/image; SLA ~8-12s | Prompt-based edits avoid pixel-level tooling; same provider for consistency |
+| **Stream Envelope** | Chunk serialization to frontend | ai-hub-sdk built-in (communication.py) | JSON over SSE | Negligible | Native HTTP streaming; frontend handles reconnect; NDJSON serialization |
+| **Storage/CDN** | Persist generated images; return URLs to frontend | GCS, S3, or Cloudinary | TBD post-MVP | Depends on provider | Short-lived signed URLs (2-4 hour TTL) to avoid token refresh; CDN caching for common styles |
+
+#### 3.3.1 LLM choice rationale: Gemini 2.5-flash
+
+- **When used**: Intent detection (logo_analyze), guideline synthesis (logo_generate), edit intent parsing (logo_edit).
+- **Performance vs alternatives**:
+  - Gemini 2.5-flash: TTFB ~500ms-1s, cost $0.50/M in + $2/M out.
+  - Claude 3.5 Sonnet: TTFB ~2-3s (misses p95 < 1.5s target), cost $3/M in + $15/M out.
+  - **Result**: Gemini meets latency + cost targets.
+- **Fallback**: If Gemini rate-limited, switch to Claude with relaxed p95 < 3s (impacts UX perception but acceptable).
+
+#### 3.3.2 Image generation choice: Nano Banana (Stable Diffusion 3.5)
+
+- **When used**: Logo generation (logo_generate), edit regeneration (logo_edit).
+- **Performance vs alternatives**:
+  - Nano Banana (Stable Diffusion 3.5): SLA ~8-12s/image, batch up to 4, $0.01/image, no queue.
+  - Google Imagen 4: SLA ~20-30s/image, no batch support, $0.08/image, better quality.
+  - Local Stable Diffusion: SLA ~15-20s/image on GPU, zero cost after setup, no vendor lock-in.
+  - **Result**: Nano Banana meets p95 < 25s for 3-4 images (3 × 8-12s = 24-36s, acceptable with parallelization).
+- **Post-POC upgrade**: If quality issues emerge in user testing, migrate to Imagen 4 by swapping tool adapter (no schema/flow changes).
+
+---
+
+### 3.4 End-to-end pipeline: Three stages + SLA targets
+
+#### 3.4.1 Stage A: Analyze + Clarification
+
+| Aspect | Detail |
+| :--- | :--- |
+| **Input Schema** | `LogoGenerateInput`: query (required), references (optional), session_id, allow_skip_clarification (boolean) |
+| **Backend tasks** | 1. Extract intent + brand context from query. 2. Analyze reference images (optional; deferred in POC). 3. Decide if clarification needed. 4. Generate explicit assumptions if user skips clarification. |
+| **LLM calls** | Gemini 2.5-flash × 1: stream intent detection + clarification decision (streaming tokens for early reasoning emission) |
+| **Image API calls** | None |
+| **Output chunks** | `clarification` (if needed), `reasoning` (streaming), `guideline` (structured JSON) |
+| **Success criteria** | >= 90% of requests return usable guideline; all reasoning understandable; Stage A latency ≤ 1.5s p95 (TTFB mainly) |
+| **SLA** | 0-1.5s from request to first reasoning chunk; 1.5-3s to complete guideline |
+
+#### 3.4.2 Stage B: Generate
+
+| Aspect | Detail |
+| :--- | :--- |
+| **Input Schema** | `DesignGuideline` (from Stage A), variation_count (3-4) |
+| **Backend tasks** | 1. Refine prompt template from guideline. 2. Call Nano Banana × 3-4 (parallel if capacity allows). 3. Upload each image to storage. 4. Attach metadata: seed, quality_flags (e.g., "has_text_artifacts"), timing |
+| **LLM calls** | None (prompt template pre-defined) |
+| **Image API calls** | Nano Banana × 3-4 (parallel; ~8-12s each; expect 10-15s wall-clock time) |
+| **Output chunks** | `image_option` (×3-4, each with url), `suggestion` (e.g., "Tap to edit colors"), `done` |
+| **Success criteria** | >= 90% of requests return 3-4 valid PNG images; no format/encoding errors; total time ≤ 25s p95 |
+| **SLA** | 3-20s from Stage A end to first image_option; 10-25s for all 3-4 images + done |
+
+#### 3.4.3 Stage C: Edit
+
+| Aspect | Detail |
+| :--- | :--- |
+| **Input Schema** | `LogoEditInput`: selected_option_id, selected_image_url, edit_prompt (required), guideline (from Stage A) |
+| **Backend tasks** | 1. Parse edit intent (optional: use LLM to disambiguate if prompt complex). 2. Call Nano Banana (img2img mode on selected image). 3. Upload edited result. 4. Generate edit summary ("Changed colors to blue palette, kept icon unchanged") |
+| **LLM calls** | Gemini 2.5-flash × 1 (optional): parse edit intent if ambiguous; edit summary generation |
+| **Image API calls** | Nano Banana × 1 (img2img/inpainting; ~8-12s SLA) |
+| **Output chunks** | `reasoning` (if LLM called), `edit_result` (new image url + summary), `suggestion`, `done` |
+| **Success criteria** | >= 85% of edits preserve core concept while reflecting requested change; edit summary accurate |
+| **SLA** | 0-12s total (LLM parse ~1s if needed, image generation ~10s, upload ~1s) |
+
+#### 3.4.4 Full sequence: Generate → Edit (Mermaid sequence diagram)
 
 ```mermaid
 sequenceDiagram
     actor FE as Frontend
     participant API as Stream API
-    participant ORCH as Logo Orchestrator
-    participant LLM as LLM API
-    participant IMG as Image API
+    participant ORCH as Orchestrator
+    participant LLM as Gemini 2.5-flash
+    participant IMG as Nano Banana
     participant STO as Storage/CDN
 
-    FE->>API: POST /internal/v1/tasks/stream (logo_generate)
-    API->>ORCH: validate input + init session
-    ORCH->>LLM: analyze + reasoning + guideline
-    LLM-->>ORCH: reasoning blocks + design guideline
-    ORCH-->>API: chunk(reasoning/guideline)
-    API-->>FE: stream chunks
+    FE->>API: POST /stream (logo_generate)<br/>query + refs
+    Note over API,ORCH: === STAGE A: ANALYZE (target: 0-1.5s to first chunk) ===
+    API->>ORCH: validate schema + init session
+    ORCH->>LLM: analyze(query, refs, context)
+    activate LLM
+    LLM-->>ORCH: [stream] reasoning tokens
+    ORCH-->>API: chunk(reasoning, seq:1)
+    API-->>FE: reasoning displayed
+    LLM-->>ORCH: [stream] more reasoning + guideline JSON
+    deactivate LLM
+    ORCH-->>API: chunk(guideline, seq:2)
+    API-->>FE: guideline rendered
 
-    loop 3-4 options
-        ORCH->>IMG: generate image from guideline
-        IMG-->>ORCH: image bytes/url
-        ORCH->>STO: upload image
-        STO-->>ORCH: image_url
-        ORCH-->>API: chunk(image_option)
-        API-->>FE: image_option
+    Note over API,ORCH: === STAGE B: GENERATE (target: 10-25s total) ===
+    ORCH->>IMG: generate(prompt_1) [parallel]
+    ORCH->>IMG: generate(prompt_2) [parallel]
+    ORCH->>IMG: generate(prompt_3) [parallel]
+    ORCH->>IMG: generate(prompt_4) [parallel]
+
+    par Image 1
+        IMG-->>ORCH: image_1_bytes
+        ORCH->>STO: upload
+        STO-->>ORCH: url_1
+        ORCH-->>API: chunk(image_option, id:1, seq:3)
+        API-->>FE: display image 1
+    and Image 2
+        IMG-->>ORCH: image_2_bytes
+        ORCH->>STO: upload
+        STO-->>ORCH: url_2
+        ORCH-->>API: chunk(image_option, id:2, seq:4)
+        API-->>FE: display image 2
+    and Image 3
+        IMG-->>ORCH: image_3_bytes
+        ORCH->>STO: upload
+        STO-->>ORCH: url_3
+        ORCH-->>API: chunk(image_option, id:3, seq:5)
+        API-->>FE: display image 3
+    and Image 4
+        IMG-->>ORCH: image_4_bytes
+        ORCH->>STO: upload
+        STO-->>ORCH: url_4
+        ORCH-->>API: chunk(image_option, id:4, seq:6)
+        API-->>FE: display image 4
     end
 
-    ORCH-->>API: chunk(done)
-    API-->>FE: done
+    ORCH-->>API: chunk(suggestion, seq:7)
+    ORCH-->>API: chunk(done, seq:8)
+    API-->>FE: done signal
 
-    FE->>API: POST /internal/v1/tasks/stream (logo_edit)
-    API->>ORCH: selected_image_url + edit_prompt
-    ORCH->>IMG: edit image
-    IMG-->>ORCH: updated image
-    ORCH->>STO: upload updated image
-    STO-->>ORCH: updated_image_url
-    ORCH-->>API: chunk(edit_result), chunk(done)
-    API-->>FE: edit_result + done
+    FE->>API: POST /stream (logo_edit)<br/>selected_option_id + edit_prompt + guideline
+    Note over API,ORCH: === STAGE C: EDIT (target: 0-12s) ===
+    API->>ORCH: validate LogoEditInput
+    ORCH->>LLM: (optional) parse_edit_intent(edit_prompt)
+    LLM-->>ORCH: edit intent + summary_plan
+    ORCH->>IMG: edit(selected_url, edit_prompt)
+    IMG-->>ORCH: edited_image_bytes
+    ORCH->>STO: upload
+    STO-->>ORCH: edited_url
+    ORCH-->>API: chunk(reasoning, seq:1)
+    ORCH-->>API: chunk(edit_result, edited_url, seq:2)
+    API-->>FE: display edited image
+    ORCH-->>API: chunk(done, seq:3)
+    API-->>FE: done
 ```
+
+#### 3.4.5 Error handling (target SLA: 3s)
+
+On error in any stage:
+
+1. **Catch & map** (immediate):
+   - Catch exceptions; map to error code: `MODEL_TIMEOUT`, `INVALID_INPUT_SCHEMA`, `PROVIDER_UNAVAILABLE`, `EDIT_INTENT_UNPARSEABLE`, `STORAGE_UPLOAD_FAILED`, `SESSION_EXPIRED`, `RATE_LIMIT_EXCEEDED`.
+
+2. **Emit error chunk** (within 3s):
+   ```
+   chunk(
+       error,
+       code: "MODEL_TIMEOUT",
+       message: "Image generation took too long. Please try again.",
+       retryable: true,
+       suggested_action: "Retry with fewer options (3 instead of 4)"
+   )
+   ```
+
+3. **Fallback strategies**:
+   - **Stage A error**: Partial guideline + warning + allow proceed to generation (risky but gives user some output).
+   - **Stage B partial failure** (2/4 images generated, 2 timeout): Emit successful images + error for remainder + option to retry.
+   - **Stage C error**: Offer immediate retry (edit prompt often OK on second attempt).
+
+---
+
+### 3.5 Extensibility & reusability patterns
+
+#### 3.5.1 Adding new inputs/outputs (within existing tasks)
+
+**Example**: Add `ai_improvement_suggestions` to DesignGuideline.
+
+1. Add field to `DesignGuideline` pydantic model.
+2. Update Gemini prompt template to generate field.
+3. Update Nano Banana prompt template to respond to suggestions.
+4. **No changes needed** to communication layer, streaming protocol, or frontend rendering.
+
+#### 3.5.2 Swapping providers (zero impact to tasks/schemas)
+
+**Example**: Upgrade from Nano Banana to Google Imagen 4.
+
+1. Create new `ImageGenTool_Imagen4` adapter with same input/output interface.
+2. Update orchestrator config: `image_gen_tool = ImageGenTool_Imagen4()`.
+3. **No changes needed** to schemas, stream format, orchestrator flow, or frontend code.
+
+#### 3.5.3 Adding new task type (reuse existing tools)
+
+**Example**: Add `logo_variation` (regenerate selected logo with subtle differences).
+
+1. Define `LogoVariationInput` schema.
+2. Register task type in routing table.
+3. Implement orchestration flow: Gemini (guideline refinement) → Nano Banana (generation).
+4. **Reuse** existing `ImageGenTool`, `StorageTool`, streaming infrastructure.
+
+#### 3.5.4 Rule placement strategy (no hardcoded business rules)
+
+Business logic lives in **three places only**; never in a separate rules engine:
+
+1. **Pydantic schemas** (constraints): `variation_count: int = Field(ge=3, le=4)`.
+2. **Prompt templates** (LLM behavior): "For tech startups, prefer: minimalist, sans-serif, monochrome".
+3. **Tool adapters** (integration logic): Quality checks, retry policies, fallback thresholds.
+
+**Why**: Rules in prompts + schema are easier to test, audit, and modify than a dedicated rules DSL. They stay close to data.
+
+---
+
+### 3.6 Decision record: Why NOT a rule engine
+
+**Considered**: Dedicated rules engine (e.g., Drools, Simple Rules) for:
+- Guideline generation rules: `IF (user_industry == "tech") THEN style = "modern"`.
+- Quality gates: `IF (artifact_count > 3) THEN reject_image`.
+
+**Rejected because**:
+1. **Testing overhead**: Pydantic + prompt templates are easier to unit-test than rule interpreter.
+2. **Latency**: Rule interpreter adds 100-200ms of latency; rules live in prompts (co-located with LLM).
+3. **Maintainability**: Rules syntax (e.g., Drools RETE) harder to modify than prompt + schema fields.
+4. **Flexibility**: Hardcoded rules can't adapt to edge cases; LLM reasoning is inherently flexible + can explain reasoning.
+
+**Outcome**: All business rules encoded in:
+- **Pydantic constraints** (hard guardrails).
+- **LLM prompts** (soft heuristics + reasoning).
+- **Tool adapters** (quality checks + fallbacks).
 
 ---
 
