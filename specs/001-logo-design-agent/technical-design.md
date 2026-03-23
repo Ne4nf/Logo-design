@@ -92,7 +92,7 @@ Business validation goals:
 Stage A - Analyze:
 
 - Input: `LogoGenerateInput` (query, references, session_id).
-- Backend responsibilities:
+- Handle:
   - intent detection
   - context extraction
   - clarification decision
@@ -105,7 +105,7 @@ Stage A - Analyze:
 Stage B - Generate:
 
 - Input: guideline + generation parameters.
-- Backend responsibilities:
+- Handle:
   - build model prompt from guideline
   - call image generation provider 3-4 times (or batch)
   - upload assets to storage
@@ -118,7 +118,7 @@ Stage B - Generate:
 Stage C - Edit:
 
 - Input: `LogoEditInput` (selected image, edit prompt, guideline).
-- Backend responsibilities:
+- Handle:
   - parse edit intent
   - call image edit provider
   - upload edited result
@@ -129,32 +129,7 @@ Stage C - Edit:
   - `suggestion`
   - `done`
 
-### 3.4 Backend-frontend contract (frontend only adds input)
 
-Frontend implementation only needs to:
-
-- Send valid `task_type` + `input_args` per schema.
-- Render by `chunk_type` from `StreamEnvelope`.
-- Respect `sequence` for display ordering.
-
-Frontend does not need to know:
-
-- Internal prompts.
-- Tool routing logic.
-- Concrete provider implementation.
-
-Frontend next steps:
-
-1. Generate form:
-   - fields: query, references (optional), variation_count.
-2. Stream renderer:
-   - handles `clarification/reasoning/guideline/image_option/suggestion/done/error`.
-3. Option selection:
-   - stores `selected_option_id` and `selected_image_url`.
-4. Edit form:
-   - fields: edit_prompt + selected option.
-5. Error UI:
-   - renders retry guidance from error payload.
 
 ### 3.5 Orchestrator execution blueprint
 
