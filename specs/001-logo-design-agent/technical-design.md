@@ -55,7 +55,7 @@ Business validation goals:
 
 ## 3. System Architecture
 
-### 3.1 Architecture principles (backend-first, reusable)
+### 3.1 Architecture principles (reusable)
 
 - Task-first:
   - Each business capability is an independent task (`logo_analyze`, `logo_generate`, `logo_edit`).
