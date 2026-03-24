@@ -146,7 +146,7 @@ graph TB
   - Gemini 2.5-flash: TTFB ~500ms-1s, cost $0.50/M in + $2/M out.
   - Claude 3.5 Sonnet: TTFB ~2-3s (misses p95 < 1.5s target), cost $3/M in + $15/M out.
   - **Result**: Gemini meets latency + cost targets.
-  - **Post-POC upgrade**: If reasoning issues emerge in user testing, migrate to Claude 3.5 Sonnet by swapping tool adapter (no schema/flow changes) - impacts UX perception but acceptable.
+- **Post-POC upgrade**: If reasoning issues emerge in user testing, migrate to Claude 3.5 Sonnet by swapping tool adapter (no schema/flow changes) - impacts UX perception but acceptable.
 
 #### 3.3.2 Image generation choice: Nano Banana (Stable Diffusion 3.5)
 
