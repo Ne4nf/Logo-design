@@ -166,7 +166,10 @@ graph TB
 | Aspect | Detail |
 | :--- | :--- |
 | **Input Schema** | `LogoGenerateInput`: query (required), references (optional), session_id, allow_skip_clarification (boolean) |
-| **Backend tasks** | 1. Extract intent + brand context from query. 2. Analyze reference images (optional; deferred in POC). 3. Decide if clarification needed. 4. Generate explicit assumptions if user skips clarification. |
+| **Backend tasks** | 1. Extract intent + brand context from query. 
+2. Analyze reference images (optional; deferred in POC). 
+3. Decide if clarification needed. 
+4. Generate explicit assumptions if user skips clarification. |
 | **LLM calls** | Gemini 2.5-flash × 1: stream intent detection + clarification decision (streaming tokens for early reasoning emission) |
 | **Image API calls** | None |
 | **Output chunks** | `clarification` (if needed), `reasoning` (streaming), `guideline` (structured JSON) |
