@@ -146,7 +146,7 @@ graph TB
   - Gemini 2.5-flash: TTFB ~500ms-1s, cost $0.50/M in + $2/M out.
   - Claude 3.5 Sonnet: TTFB ~2-3s (misses p95 < 1.5s target), cost $3/M in + $15/M out.
   - **Result**: Gemini meets latency + cost targets.
-- **Fallback**: If Gemini rate-limited, switch to Claude with relaxed p95 < 3s (impacts UX perception but acceptable).
+  - **Post-POC upgrade**: If reasoning issues emerge in user testing, migrate to Claude 3.5 Sonnet by swapping tool adapter (no schema/flow changes) - impacts UX perception but acceptable.
 
 #### 3.3.2 Image generation choice: Nano Banana (Stable Diffusion 3.5)
 
@@ -154,7 +154,6 @@ graph TB
 - **Performance vs alternatives**:
   - Nano Banana (Stable Diffusion 3.5): SLA ~8-12s/image, batch up to 4, $0.01/image, no queue.
   - Google Imagen 4: SLA ~20-30s/image, no batch support, $0.08/image, better quality.
-  - Local Stable Diffusion: SLA ~15-20s/image on GPU, zero cost after setup, no vendor lock-in.
   - **Result**: Nano Banana meets p95 < 25s for 3-4 images (3 × 8-12s = 24-36s, acceptable with parallelization).
 - **Post-POC upgrade**: If quality issues emerge in user testing, migrate to Imagen 4 by swapping tool adapter (no schema/flow changes).
 
