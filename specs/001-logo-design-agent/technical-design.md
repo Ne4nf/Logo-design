@@ -19,6 +19,8 @@ Out-of-scope:
 - Step 7: prompt-based editing
 - Step 8: follow-up suggestions
 
+(Note: Step 5 "Design direction selection" is bypassed/automated in this POC to streamline the generation flow)
+
 ### 1.2 Success metrics (POC acceptance targets)
 
 - >= 90% requests extract brand_name and industry from user query.
