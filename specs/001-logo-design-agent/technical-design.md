@@ -49,6 +49,7 @@ Key UX point: User sees real-time reasoning via Stream and may re-call Stream wi
   - `POST /internal/v1/tasks/submit`
   - `GET /internal/v1/tasks/{task_id}/status`
   - `POST /internal/v1/tasks/stream`
+- Frontend should communicate through a Backend-for-Frontend (BFF), which manages NDJSON/gRPC stream connections and forwards UI-friendly events.
 - Primary task type for this POC: `logo_generate`.
 - Required fields (mandatory before generation):
   - `brand_name` (company/product name)
@@ -85,6 +86,8 @@ Key UX point: User sees real-time reasoning via Stream and may re-call Stream wi
 
 This architecture is designed for strict quality gating in POC with AI Hub native execution: Stream for real-time reasoning and clarification, then async SubmitTask/GetTaskStatus for long-running image generation.
 
+This system behaves like a chat-based design assistant: users interact via streaming responses, and the system dynamically asks for missing information before completing the task.
+
 Key reasons:
 
 1. Fail-fast required-field validation enforces required design inputs before generation begins.
@@ -92,6 +95,7 @@ Key reasons:
 3. All processing happens server-side; FE does not hold the connection.
 4. Session context is explicit and propagated between tools for deterministic behavior.
 5. In POC, planner is simplified to rule-based routing inside a single worker process.
+6. Stream ends when guideline is ready; image generation always runs asynchronously.
 
 #### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
 
@@ -259,7 +263,7 @@ sequenceDiagram
 
   rect rgb(245, 255, 245)
     Note over FE,WORKER: Phase 2 - Async image generation (Stage C)
-    WORKER->>API: Internal SubmitTask(task_type=logo_generate, mode=generate)
+    WORKER->>API: Enqueue Stage C as new async task via AIHubAsyncService.SubmitTask
     API->>Q: enqueue generation task
     API-->>WORKER: {task_id, status: pending}
     WORKER-->>FE: stream chunk includes generation task_id
@@ -465,19 +469,19 @@ class LogoGenerateOutput(BaseModel):
 
 class JobSubmitResponse(BaseModel):
     task_id: str
-  status: Literal["pending"]
-  task_type: str
+    status: Literal["pending"]
+    task_type: str
 
 
 class JobStatusResponse(BaseModel):
     task_id: str
-  status: Literal["pending", "processing", "completed", "failed"]
-  task_type: str
+    status: Literal["pending", "processing", "completed", "failed"]
+    task_type: str
     progress_percent: Optional[int] = None  # 0-100 if processing
     result: Optional[LogoGenerateOutput] = None  # populated when completed
-  metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
     error_code: Optional[str] = None  # populated when failed (e.g., MISSING_REQUIRED_FIELDS)
-  error_message: Optional[str] = None  # populated when failed
+    error_message: Optional[str] = None  # populated when failed
     missing_fields: List[str] = Field(default_factory=list)  # populated when failed
     suggested_questions: List[SuggestedQuestion] = Field(default_factory=list)  # populated when failed
     retry_after_seconds: Optional[int] = None  # populated when failed
@@ -510,6 +514,7 @@ This section follows AI Hub SDK fixed APIs. The design maps into existing async 
   - gRPC: `AIHubStreamService.Stream(TaskRequest) -> stream TaskStatus`
   - HTTP gateway: `POST /internal/v1/tasks/stream`
   - Media type: `application/x-ndjson` (JSON Lines), not SSE.
+  - FE integration recommendation: browser UI talks to BFF; BFF owns stream connection and pushes normalized events to UI.
   - Request body pattern:
     ```json
     {
@@ -533,7 +538,8 @@ This section follows AI Hub SDK fixed APIs. The design maps into existing async 
     - Worker emits a `processing` chunk with `metadata.event_type = clarification_needed`, `missing_fields`, and `suggested_questions`.
     - FE asks user and collects answer.
     - FE re-calls `Stream` with updated `input_args` and same `session_id`.
-    - Worker merges updated input with session context and continues pipeline.
+    - On re-call, only updated fields are required in `input_args`; worker merges new input with session context by precedence (explicit > extracted > session).
+    - Worker continues pipeline from merged context.
 
 - Async generation and polling (Stage C)
   - gRPC submit: `AIHubAsyncService.SubmitTask(TaskRequest) -> SubmitTaskResponse`
@@ -548,6 +554,7 @@ This section follows AI Hub SDK fixed APIs. The design maps into existing async 
     ```
   - gRPC poll: `AIHubAsyncService.GetTaskStatus(GetTaskStatusRequest) -> TaskStatus`
   - HTTP gateway poll: `GET /internal/v1/tasks/{task_id}/status`
+  - Stream/async boundary: Stream ends when guideline is ready; image generation always proceeds in async mode.
   - Processing response example:
     ```json
     {
