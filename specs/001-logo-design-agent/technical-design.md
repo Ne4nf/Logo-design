@@ -4,35 +4,52 @@
 
 ### 1.1 POC objective
 
-This POC builds a backend-driven Logo Design Service using a chat-first workflow:
+Build an async backend Logo Design Service for Step 1 -> Step 6 only.
 
-- Input: user query (text, optional image references).
-- Backend flow: analyze request, produce reasoning, produce design guideline, generate 3-4 logo options, apply prompt-based edits.
-- Output: image URLs (minimum PNG 1024x1024) and edit summary.
+In-scope:
 
-Business validation goals:
+- Step 1: intent detect
+- Step 2: input extraction + reference analysis
+- Step 3: required-field validation and clarification
+- Step 4: design guideline inference
+- Step 6: generate 3-4 logo options
 
-- Prove users can complete the full loop: request -> analyze -> guideline -> generate -> select -> edit -> regenerate.
-- Prove visible reasoning is understandable and useful.
-- Prove editing is usable without region-level editing tools.
+Out-of-scope:
 
-### 1.2 Success metrics
+- Step 7: prompt-based editing
+- Step 8: follow-up suggestions
 
-- >= 90% of requests return a design guideline before image generation starts.
-- >= 90% of requests return 3-4 valid logo options.
-- >= 85% of sessions complete end-to-end flow without restart.
-- >= 85% of edit requests reflect requested changes while preserving core concept.
-- p95 time to first reasoning chunk <= 1.5s.
-- p95 time to complete 3-4 logo outputs <= 25s.
-- On generation/edit failure, actionable error + retry guidance returned <= 3s.
+### 1.2 Success metrics (POC acceptance targets)
 
-### 1.3 Technical constraints
+- >= 90% requests extract brand_name and industry from user query.
+- >= 90% requests that pass required-field gate produce valid `guideline` before image generation starts.
+- >= 85% requests return 3-4 valid logo options.
+- p95 job completion time <= 30s (from submit to completed).
+- p95 time to first status transition (queued -> processing) <= 5s.
+- On failure, return actionable error + retry hint <= 5s.
 
-- Single image model in POC to reduce integration risk.
-- No hardcoded business rule engine; use schema-driven and prompt-driven behavior.
-- Out of scope: touch edit, smart mark, region/object-level editing.
-- Session scope is single-session only.
-- Stream API is primary channel for incremental UX.
+### 1.3 User Journey (5-step POC flow)
+
+1. **User enters logo request** → Submit query with optional brand details
+2. **System shows thinking** → Frontend shows "Processing..." with streaming reasoning visible
+3. **If missing info** → System asks clarification question (e.g., "What is your brand name?"), user answers in chat
+4. **System generates guideline** → Design guideline created, user sees it via stream
+5. **System generates logo options** → 3-4 logo options generated and displayed
+6. **User sees results** → Complete logos with brand context
+
+Key UX point: User does NOT wait or resubmit; everything is interactive within one task session.
+
+### 1.4 Technical constraints
+
+- Primary endpoints: async `POST /internal/v1/tasks/submit` and `GET /internal/v1/tasks/{task_id}/status`.
+- Primary task type for this POC: `logo_generate`.
+- Required fields (mandatory before generation):
+  - `brand_name` (company/product name)
+  - `industry` (business category or context)
+- Single request per job; input may be partial when `use_session_context` is enabled.
+- Required-field precedence is fixed: explicit fields in request > extracted fields from new query > stored session context.
+- Session scope is per `session_id` with short-term memory reuse across jobs.
+- Provider switching must not change task semantics or output contract.
 
 ---
 
@@ -43,13 +60,13 @@ Business validation goals:
 | Area | Build (POC) | Defer |
 | :--- | :--- | :--- |
 | Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
-| Clarification | Ask clarification when needed, allow skip with explicit assumptions | Adaptive multi-turn clarification policy |
-| Reasoning | Stream reasoning blocks (input understanding, style inference, assumptions) | Multi-agent debate and self-critique loops |
-| Guideline | Generate structured design guideline before generation | Auto-optimization guideline loop via evaluator |
-| Generation | Generate 3-4 PNG options from guideline | Multi-model routing and auto-ranking |
-| Editing | Prompt-based edit on selected option + edit summary | Region/object-level editing |
-| Follow-up | Return quick follow-up suggestions | Personalized recommendation engine |
-| Storage/session | Persist output URLs + metadata per request/session | Project library, version history, long-term memory |
+| Clarification | Fail-fast required-field validation with suggested follow-up questions | Adaptive personalized questioning policy |
+| Reasoning | Internal reasoning for extraction and inference | Multi-agent self-critique loops |
+| Guideline | Generate structured design guideline before generation | Automatic guideline optimization loop |
+| Generation | Generate 3-4 PNG options from guideline | Auto model-routing and ranking |
+| Storage/session | Persist output URLs + session context per `session_id` | Project library, version history, long-term memory |
+| Editing | Deferred | Step 7 in next phase |
+| Follow-up suggestion | Deferred | Step 8 in next phase |
 
 ---
 
@@ -59,305 +76,302 @@ Business validation goals:
 
 #### 3.1.1 Why this solution
 
-We chose a **streaming-first, task-based architecture** because:
+This architecture is designed for strict quality gating in POC with interactive task completion: submit once, then interactively complete the task via streaming (visible thinking + clarification) and async generation.
 
-1. **Early visibility** (UX): Emit reasoning and guideline chunks within 1-2s, so users see progress before image generation begins (slow operation).
-2. **Modular reuse**: Each capability (analyze, generate, edit) is a task type that can be called independently or composed.
-3. **Provider agility**: Tool abstraction lets us swap image generators (Nano Banana → other) without touching core orchestration logic.
-4. **Async-ready**: Stream API can later become async (webhook) if frontend drops long-polling.
+Key reasons:
 
-#### 3.1.2 System architecture diagram (Layered)
+1. Fail-fast required-field validation enforces required design inputs before generation begins.
+2. Hybrid execution improves UX: Stage A+B stream reasoning in real time, Stage C runs async for image generation.
+3. All processing happens server-side; FE does not hold the connection.
+4. Session context is explicit and propagated between tools for deterministic behavior.
+5. In POC, planner is simplified to rule-based routing inside a single worker process.
+
+#### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
 
 ```mermaid
-graph TB
-    FE["Frontend<br/>(Chat UI)"]
-    API["Communication Layer<br/>(Stream API)"]
-    TASK["Task Execution Layer<br/>(BaseTask + logo_generate/edit)"]
-    ORCH["Orchestrator<br/>(planning + LLM calls)"]
-    TOOLS["Tools Layer<br/>(LLM tool, ImageGen tool)"]
-    GEMINI["Gemini 2.5-flash<br/>(reasoning + guideline)"]
-    NANONA["Nano Banana<br/>(Stable Diffusion 3.5)"]
-    STORAGE["Storage/CDN<br/>(image URLs)"]
+flowchart LR
+  U[User Submit Job] --> P[Planner\nStep 1: Intent + route\nStep 2: extraction plan]
 
-    FE -->|POST /stream| API
-    API -->|dispatch by task_type| TASK
-    TASK -->|delegate| ORCH
-    ORCH -->|call_tool| TOOLS
-    TOOLS -->|text API| GEMINI
-    TOOLS -->|HTTP/MCP| NANONA
-    TOOLS -->|upload| STORAGE
-    STORAGE -->|signed URLs| FE
+  subgraph EXEC[Task Execution]
+    direction TB
+    T1[Task A\nInputExtractionTool]
+    T2[Task B\nReferenceImageAnalyzeTool]
+    O[Observer/Gate\nmerge fields + check required]
+    C[ClarificationLoopTool]
+    D[DesignInferenceTool]
+    G[LogoGenerationTool]
+    S[StorageTool]
+  end
+
+  X[(Context Store)]
+
+  P --> T1
+  P --> T2
+  T1 --> O
+  T2 --> O
+  O -->|missing required fields| C
+  C --> O
+  O -->|required fields ready| D
+  D --> G --> S --> R[Job Result Ready]
+
+  P <-. read/write .-> X
+  O <-. read/write .-> X
+  C <-. read/write .-> X
+  D <-. checkpoint .-> X
+  G <-. checkpoint .-> X
 ```
 
-#### 3.1.3 System layers & responsibilities
+#### 3.1.3 Diagram 2 - System components (layered)
 
-- **Communication layer** (REST API): Route by `task_type`, validate input schema, stream chunks to client.
-- **Task layer** (ai-hub-sdk): Define `logo_generate` and `logo_edit` as tasks with structured input/output; register with `ServingMode.STREAM`.
-- **Orchestration layer** (Agent + Orchestrator): Call LLM for reasoning/guideline, coordinate tools, emit stream chunks in order.
-- **Tool layer** (Function tools + MCP): Stable abstractions for LLM calls and image generation; support timeout, retry, tool filtering.
-- **Integration layer** (external APIs): **Gemini 2.5-flash** for reasoning, **Nano Banana/Stable Diffusion** for image generation.
-- **Storage layer** (object storage + CDN): Persist images, return signed/public URLs with TTL.
+```mermaid
+graph LR
+    FE[Frontend]
+    API[Task API\nsubmit + status]
+    Q[Job Queue]
 
----
+    subgraph ORCH[Orchestrator]
+      P[Planner]
+      TS[Task Workers]
+      O[Observer]
+    end
 
-### 3.2 Architecture principles & decision rationale
+    CTX[(Context Store)]
+    LLM[Text/Multimodal LLM]
+    IMG[Image API]
+    STO[Storage/CDN]
 
-#### 3.2.1 Task-first
+    FE --> API --> Q --> P
+    P --> TS --> O
+    O --> API --> FE
 
-- Each business capability is an independent task: `logo_analyze`, `logo_generate`, `logo_edit`.
-- Routing is based on `task_type`, not endpoint-specific hardcoding.
-- **Rationale**: Enables reuse by other features (variation, batch generation, A/B testing) without code duplication; scales to multi-model routing in production.
+    TS --> LLM
+    TS --> IMG
+    TS --> STO
 
-#### 3.2.2 Schema-first
+    P <-. full context .-> CTX
+    O <-. full context .-> CTX
+    TS -. task output only .-> O
+```
 
-- All contracts use Pydantic: `LogoGenerateInput`, `DesignGuideline`, `StreamEnvelope`.
-- Validation at boundary (communication layer); schema changes don't require flow rewrites.
-- **Rationale**: Type safety + backward compatibility; new fields = new template logic, not orchestrator changes.
+**Note for POC:** Planner, Observer, and Task Workers are logically separated but implemented as a single worker service to keep implementation simple. They can be decoupled into separate microservices in production.
 
-#### 3.2.3 Stream-first
+### 3.2 Architecture principles
 
-- `POST /internal/v1/tasks/stream` is default execution path.
-- Frontend renders by `chunk_type` from `StreamEnvelope`, respects `sequence` for ordering.
-- **Rationale**: Achieves p95 first reasoning chunk ≤ 1.5s by streaming tokens early; frontend controls rendering independently.
+- Task-first:
+  - Business capability exposed as `logo_generate` in this phase.
+  - Routing by `task_type`, no endpoint-specific business hardcoding.
+- Schema-first:
+  - All contracts validated by Pydantic.
+  - Required-field gate is encoded as schema and validator rules.
+- Async job-based:
+  - Hybrid execution is used:
+    - Stage A+B: SSE streaming for visible process thinking.
+    - Stage C: async image task with polling.
+  - `POST /internal/v1/tasks/submit` creates task and returns `task_id`.
+  - `GET /internal/v1/tasks/{task_id}/status` is used primarily for Stage C result polling.
+- Context-first tool handoff:
+  - Every step reads/writes the same session memory snapshot.
+  - Tools return deltas only; worker merges and persists checkpoints.
+  - Tool swap must preserve context I/O contract.
 
-#### 3.2.4 Tool abstraction
+#### 3.2.1 Memory flow contract (context engineering style)
 
-- Agent calls tools behind stable interface: `LLMTool`, `ImageGenerationTool`, `ImageEditTool`.
-- Providers swappable: Gemini → Claude, Nano Banana → Imagen 4, without touching orchestrator.
-- **Rationale**: POC agility (test different models); production upgrade path (enhance quality) without rearchitecting.
+This section defines memory behavior so the pipeline is deterministic and easy to reason about:
 
----
+1. **Worker keeps execution state**:
+  - Worker owns `task_id`, `current_step`, round counters, and status transitions.
+  - Task-local runtime state is not stored in tool adapters.
+2. **Tools are stateless and receive lightweight context**:
+  - Input to each tool is scoped to required fields only (`session_id`, required field state, relevant context slice).
+  - Tools do not own global session memory.
+3. **Tools return deltas, worker merges**:
+  - Each tool returns only changed fields (delta), not full state overwrite.
+  - Worker merges delta into current state using fixed precedence rules.
+4. **Persist checkpoints in SessionContextStore**:
+  - Save checkpoint after Stage A (required fields), Stage B (guideline), Stage C (final output URLs).
+  - Cross-job reuse always loads from SessionContextStore.
+5. **Use `context_version` for stale-write protection**:
+  - Every write validates expected `context_version`.
+  - On version mismatch, worker reloads latest context and retries merge.
 
-### 3.3 Component breakdown & external service decisions
+#### 3.2.2 POC simplification notes
 
-| Component | Role | External Service | Decision | Cost/Latency | Rationale |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **LLM Tool** (in Orchestrator) | Intent detection, reasoning generation, guideline synthesis | **Gemini 2.5-flash** (streaming) | Text-only input; stream tokens for reasoning chunks | ~$0.50/M input, $2/M output; TTFB ~500ms | Fastest TTFB (<1.5s p95); cost-effective for POC; native streaming for chunk emission |
-| **Vision Tool** (Analyze stage, optional) | Extract style/color/iconography from reference images | Gemini 2.5-flash multimodal OR deferred | Deferred in POC | N/A | Scope reduction; text-based analysis covers 80% of use cases; can add later |
-| **ImageGen Tool** (Generate stage) | Generate 3-4 PNG logos from prompt + guideline | **Nano Banana API** (Stable Diffusion 3.5-turbo) | Batch-capable; HTTP/MCP endpoint | ~$0.01-0.02/image; SLA ~8-12s per image | Affordable POC ($0.04-0.08/request for 4 images); parallel support for 3-4 concurrent; no waiting list |
-| **ImageEdit Tool** (Edit stage) | Regenerate selected logo with edit prompt | **Nano Banana API** (img2img mode) OR reuse generation | Img2img faster than full regenerate | ~$0.015-0.025/image; SLA ~8-12s | Prompt-based edits avoid pixel-level tooling; same provider for consistency |
-| **Stream Envelope** | Chunk serialization to frontend | ai-hub-sdk built-in (communication.py) | JSON over SSE | Negligible | Native HTTP streaming; frontend handles reconnect; NDJSON serialization |
-| **Storage/CDN** | Persist generated images; return URLs to frontend | GCS, S3, or Cloudinary | TBD post-MVP | Depends on provider | Short-lived signed URLs (2-4 hour TTL) to avoid token refresh; CDN caching for common styles |
+This design is prepared for production scale but POC implementation can be simplified:
 
-#### 3.3.1 LLM choice rationale: Gemini 2.5-flash
+- **Planner**: In POC, simplified to rule-based routing (no multi-model decision tree); planner logic is embedded in worker startup.
+- **Queue**: In POC, queue is used only for Stage C image generation; Stage A+B runs synchronously within the stream handler.
+- **Observer**: In POC, observer check is simple gate logic (required fields present?); no multi-path decision tree.
 
-- **When used**: Intent detection (logo_analyze), guideline synthesis (logo_generate), edit intent parsing (logo_edit).
-- **Performance vs alternatives**:
-  - Gemini 2.5-flash: TTFB ~500ms-1s, cost $0.50/M in + $2/M out.
-  - Claude 3.5 Sonnet: TTFB ~2-3s (misses p95 < 1.5s target), cost $3/M in + $15/M out.
-  - **Result**: Gemini meets latency + cost targets.
-- **Post-POC upgrade**: If reasoning issues emerge in user testing, migrate to Claude 3.5 Sonnet by swapping tool adapter (no schema/flow changes) - impacts UX perception but acceptable.
+These can be formalized and decoupled in subsequent phases as system scales.
 
-#### 3.3.2 Image generation choice: Nano Banana (Stable Diffusion 3.5)
+### 3.3 Component breakdown (tool-level)
 
-- **When used**: Logo generation (logo_generate), edit regeneration (logo_edit).
-- **Performance vs alternatives**:
-  - Nano Banana (Stable Diffusion 3.5): SLA ~8-12s/image, batch up to 4, $0.01/image, no queue.
-  - Google Imagen 4: SLA ~20-30s/image, no batch support, $0.08/image, better quality.
-  - **Result**: Nano Banana meets p95 < 25s for 3-4 images (3 × 8-12s = 24-36s, acceptable with parallelization).
-- **Post-POC upgrade**: If quality issues emerge in user testing, migrate to Imagen 4 by swapping tool adapter (no schema/flow changes).
+| Component or Tool | Spec step | Role | Model Type | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier; if logo intent is detected, switch from generic image generation flow to Logo Design flow |
+| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
+| ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
+| ClarificationLoopTool | Step 3 | Generate targeted clarification questions for missing required fields | Text LLM for question generation | If required fields are missing: system asks clarification question via streaming (e.g. "What is your brand name?"), user answers directly in chat, system continues within same session |
+| DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
+| LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
+| StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
+| SessionContextTool | Shared | Read/update context snapshot per session and key job checkpoints | Context adapter over cache or DB | Required for deterministic tool swap |
 
----
+### 3.4 End-to-end pipeline
 
-### 3.4 End-to-end pipeline: Three stages + SLA targets
+POC exposes one external task type: `logo_generate`.
 
-#### 3.4.1 Stage A: Analyze + Clarification
+#### 3.4.1 Full sequence overview (Streaming + Async)
 
-| Aspect | Detail |
-| :--- | :--- |
-| **Input Schema** | `LogoGenerateInput`: query (required), references (optional), session_id, allow_skip_clarification (boolean) |
-| **Backend tasks** | 1. Extract intent + brand context from query. 2. Analyze reference images (optional; deferred in POC). 3. Decide if clarification needed. 4. Generate explicit assumptions if user skips clarification. |
-| **LLM calls** | Gemini 2.5-flash × 1: stream intent detection + clarification decision (streaming tokens for early reasoning emission) |
-| **Image API calls** | None |
-| **Output chunks** | `clarification` (if needed), `reasoning` (streaming), `guideline` (structured JSON) |
-| **Success criteria** | >= 90% of requests return usable guideline; all reasoning understandable; Stage A latency ≤ 1.5s p95 (TTFB mainly) |
-| **SLA** | 0-1.5s from request to first reasoning chunk; 1.5-3s to complete guideline |
-
-#### 3.4.2 Stage B: Generate
-
-| Aspect | Detail |
-| :--- | :--- |
-| **Input Schema** | `DesignGuideline` (from Stage A), variation_count (3-4) |
-| **Backend tasks** | 1. Refine prompt template from guideline. 2. Call Nano Banana × 3-4 (parallel if capacity allows). 3. Upload each image to storage. 4. Attach metadata: seed, quality_flags (e.g., "has_text_artifacts"), timing |
-| **LLM calls** | None (prompt template pre-defined) |
-| **Image API calls** | Nano Banana × 3-4 (parallel; ~8-12s each; expect 10-15s wall-clock time) |
-| **Output chunks** | `image_option` (×3-4, each with url), `suggestion` (e.g., "Tap to edit colors"), `done` |
-| **Success criteria** | >= 90% of requests return 3-4 valid PNG images; no format/encoding errors; total time ≤ 25s p95 |
-| **SLA** | 3-20s from Stage A end to first image_option; 10-25s for all 3-4 images + done |
-
-#### 3.4.3 Stage C: Edit
-
-| Aspect | Detail |
-| :--- | :--- |
-| **Input Schema** | `LogoEditInput`: selected_option_id, selected_image_url, edit_prompt (required), guideline (from Stage A) |
-| **Backend tasks** | 1. Parse edit intent (optional: use LLM to disambiguate if prompt complex). 2. Call Nano Banana (img2img mode on selected image). 3. Upload edited result. 4. Generate edit summary ("Changed colors to blue palette, kept icon unchanged") |
-| **LLM calls** | Gemini 2.5-flash × 1 (optional): parse edit intent if ambiguous; edit summary generation |
-| **Image API calls** | Nano Banana × 1 (img2img/inpainting; ~8-12s SLA) |
-| **Output chunks** | `reasoning` (if LLM called), `edit_result` (new image url + summary), `suggestion`, `done` |
-| **Success criteria** | >= 85% of edits preserve core concept while reflecting requested change; edit summary accurate |
-| **SLA** | 0-12s total (LLM parse ~1s if needed, image generation ~10s, upload ~1s) |
-
-#### 3.4.4 Full sequence: Generate → Edit (Mermaid sequence diagram)
+High-level flow:
 
 ```mermaid
 sequenceDiagram
-    actor FE as Frontend
-    participant API as Stream API
-    participant ORCH as Orchestrator
-    participant LLM as Gemini 2.5-flash
-    participant IMG as Nano Banana
-    participant STO as Storage/CDN
+  actor FE as Frontend
+  participant S as Stream API (SSE)
+  participant API as Task API
+  participant Q as Job Queue
+  participant WORKER as Worker
 
-    FE->>API: POST /stream (logo_generate)<br/>query + refs
-    Note over API,ORCH: === STAGE A: ANALYZE (target: 0-1.5s to first chunk) ===
-    API->>ORCH: validate schema + init session
-    ORCH->>LLM: analyze(query, refs, context)
-    activate LLM
-    LLM-->>ORCH: [stream] reasoning tokens
-    ORCH-->>API: chunk(reasoning, seq:1)
-    API-->>FE: reasoning displayed
-    LLM-->>ORCH: [stream] more reasoning + guideline JSON
-    deactivate LLM
-    ORCH-->>API: chunk(guideline, seq:2)
-    API-->>FE: guideline rendered
-
-    Note over API,ORCH: === STAGE B: GENERATE (target: 10-25s total) ===
-    ORCH->>IMG: generate(prompt_1) [parallel]
-    ORCH->>IMG: generate(prompt_2) [parallel]
-    ORCH->>IMG: generate(prompt_3) [parallel]
-    ORCH->>IMG: generate(prompt_4) [parallel]
-
-    par Image 1
-        IMG-->>ORCH: image_1_bytes
-        ORCH->>STO: upload
-        STO-->>ORCH: url_1
-        ORCH-->>API: chunk(image_option, id:1, seq:3)
-        API-->>FE: display image 1
-    and Image 2
-        IMG-->>ORCH: image_2_bytes
-        ORCH->>STO: upload
-        STO-->>ORCH: url_2
-        ORCH-->>API: chunk(image_option, id:2, seq:4)
-        API-->>FE: display image 2
-    and Image 3
-        IMG-->>ORCH: image_3_bytes
-        ORCH->>STO: upload
-        STO-->>ORCH: url_3
-        ORCH-->>API: chunk(image_option, id:3, seq:5)
-        API-->>FE: display image 3
-    and Image 4
-        IMG-->>ORCH: image_4_bytes
-        ORCH->>STO: upload
-        STO-->>ORCH: url_4
-        ORCH-->>API: chunk(image_option, id:4, seq:6)
-        API-->>FE: display image 4
+  rect rgb(235, 248, 255)
+    Note over FE,WORKER: Phase 1 - Streaming thinking (Stage A + B)
+    FE->>API: POST /internal/v1/tasks/submit (task_type=logo_generate)
+    API-->>FE: {task_id, status: queued}
+    FE->>S: Open /internal/v1/tasks/{task_id}/stream (SSE)
+    S->>WORKER: Start Stage A + Stage B
+    WORKER-->>S: stream extraction status / reasoning text
+    S-->>FE: SSE chunks (visible process thinking)
+    alt missing required fields
+      WORKER-->>S: clarification event {missing_fields, suggested_questions}
+      FE->>API: POST /internal/v1/tasks/{task_id}/clarification
+      API->>WORKER: append clarification answer
+      WORKER-->>S: continue stream after merge
+    else required fields complete
+      WORKER-->>S: final event with guideline + generate_hq_task_id
+      S-->>FE: close stream
     end
+  end
 
-    ORCH-->>API: chunk(suggestion, seq:7)
-    ORCH-->>API: chunk(done, seq:8)
-    API-->>FE: done signal
-
-    FE->>API: POST /stream (logo_edit)<br/>selected_option_id + edit_prompt + guideline
-    Note over API,ORCH: === STAGE C: EDIT (target: 0-12s) ===
-    API->>ORCH: validate LogoEditInput
-    ORCH->>LLM: (optional) parse_edit_intent(edit_prompt)
-    LLM-->>ORCH: edit intent + summary_plan
-    ORCH->>IMG: edit(selected_url, edit_prompt)
-    IMG-->>ORCH: edited_image_bytes
-    ORCH->>STO: upload
-    STO-->>ORCH: edited_url
-    ORCH-->>API: chunk(reasoning, seq:1)
-    ORCH-->>API: chunk(edit_result, edited_url, seq:2)
-    API-->>FE: display edited image
-    ORCH-->>API: chunk(done, seq:3)
-    API-->>FE: done
+  rect rgb(245, 255, 245)
+    Note over FE,WORKER: Phase 2 - Async image generation (Stage C)
+    WORKER->>Q: enqueue generate_hq_task
+    Q->>WORKER: run Stage C in background
+    loop Polling image task
+      FE->>API: GET /internal/v1/tasks/{generate_hq_task_id}/status
+      alt processing
+        API-->>FE: {status: processing, progress}
+      else completed
+        API-->>FE: {status: completed, options}
+      else failed
+        API-->>FE: {status: failed, error_code}
+      end
+    end
+  end
 ```
 
-#### 3.4.5 Error handling (target SLA: 3s)
+#### 3.4.1a Stage A - Intake & clarification loop (Step 1-3)
 
-On error in any stage:
+```mermaid
+sequenceDiagram
+  actor FE as Frontend
+  participant W as Worker
+  participant C as SessionContextStore
+  participant L as LLM
 
-1. **Catch & map** (immediate):
-   - Catch exceptions; map to error code: `MODEL_TIMEOUT`, `INVALID_INPUT_SCHEMA`, `PROVIDER_UNAVAILABLE`, `EDIT_INTENT_UNPARSEABLE`, `STORAGE_UPLOAD_FAILED`, `SESSION_EXPIRED`, `RATE_LIMIT_EXCEEDED`.
+  W->>C: Load session snapshot
+  W->>L: Extract fields from query/references
+  L-->>W: Extracted BrandContext delta
+  W->>W: Merge by precedence
 
-2. **Emit error chunk** (within 3s):
-   ```
-   chunk(
-       error,
-       code: "MODEL_TIMEOUT",
-       message: "Image generation took too long. Please try again.",
-       retryable: true,
-       suggested_action: "Retry with fewer options (3 instead of 4)"
-   )
-   ```
+  alt required fields ready
+    W->>C: Persist required-field checkpoint
+  else missing required fields
+    W->>L: Generate suggested_questions for missing fields
+    L-->>W: suggested_questions
+    W-->>FE: Stream clarification event
+    FE->>W: Submit clarification answer in same task/session
+    W->>W: Merge answer and re-check required fields
+  end
+```
 
-3. **Fallback strategies**:
-   - **Stage A error**: Partial guideline + warning + allow proceed to generation (risky but gives user some output).
-   - **Stage B partial failure** (2/4 images generated, 2 timeout): Emit successful images + error for remainder + option to retry.
-   - **Stage C error**: Offer immediate retry (edit prompt often OK on second attempt).
+#### 3.4.1b Stage B - Guideline inference (Step 4)
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant C as SessionContextStore
+  participant L as LLM
+
+  W->>C: Load required-field checkpoint
+  W->>L: Infer DesignGuideline
+  L-->>W: Guideline delta
+  W->>C: Persist guideline checkpoint
+```
+
+#### 3.4.1c Stage C - Logo generation (Step 6)
+
+```mermaid
+sequenceDiagram
+  participant W as Worker
+  participant C as SessionContextStore
+  participant I as ImageAPI
+  participant S as Storage
+
+  W->>C: Load guideline checkpoint
+  loop 3-4 options
+    W->>I: Generate image from guideline
+    I-->>W: Image bytes
+    W->>S: Upload image
+    S-->>W: image_url
+    W->>W: Append URL delta
+  end
+  W->>C: Persist final-output checkpoint
+  W->>W: Mark job completed
+```
+#### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
+| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
+| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) clarification event streamed to FE and resumed within same task |
+| Gate | brand_name AND industry must both be present before Step 4; if missing, ask clarification interactively via streaming |
+| Target | Complete within first 10s of job start |
+
+#### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | Completed required fields + optional context |
+| Tools used | DesignInferenceTool |
+| Output | DesignGuideline JSON |
+| Target | Guideline coverage >= 90% |
+
+#### 3.4.4 Stage C - Logo generation (Step 6)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | guideline + variation_count |
+| Tools used | LogoGenerationTool, StorageTool |
+| Output | LogoGenerateOutput with 3-4 option URLs |
+| Target | 3-4 valid outputs >= 85%, generation <= 30s total per job |
+| Concurrency | SHOULD run in parallel when provider supports batching/multi-call concurrency |
+
+### 3.5 Reuse and extensibility
+
+- Add fields in extraction or guideline:
+  - Extend schema and prompt templates only.
+  - API contract stays unchanged.
+- Add edit phase in next release:
+  - Register `logo_edit` task type and add Stage D for Step 7.
+  - Reuse same context and job semantics.
+- Add provider:
+  - Replace generation adapter only.
+  - No change in worker state machine.
 
 ---
 
-### 3.5 Extensibility & reusability patterns
-
-#### 3.5.1 Adding new inputs/outputs (within existing tasks)
-
-**Example**: Add `ai_improvement_suggestions` to DesignGuideline.
-
-1. Add field to `DesignGuideline` pydantic model.
-2. Update Gemini prompt template to generate field.
-3. Update Nano Banana prompt template to respond to suggestions.
-4. **No changes needed** to communication layer, streaming protocol, or frontend rendering.
-
-#### 3.5.2 Swapping providers (zero impact to tasks/schemas)
-
-**Example**: Upgrade from Nano Banana to Google Imagen 4.
-
-1. Create new `ImageGenTool_Imagen4` adapter with same input/output interface.
-2. Update orchestrator config: `image_gen_tool = ImageGenTool_Imagen4()`.
-3. **No changes needed** to schemas, stream format, orchestrator flow, or frontend code.
-
-#### 3.5.3 Adding new task type (reuse existing tools)
-
-**Example**: Add `logo_variation` (regenerate selected logo with subtle differences).
-
-1. Define `LogoVariationInput` schema.
-2. Register task type in routing table.
-3. Implement orchestration flow: Gemini (guideline refinement) → Nano Banana (generation).
-4. **Reuse** existing `ImageGenTool`, `StorageTool`, streaming infrastructure.
-
-#### 3.5.4 Rule placement strategy (no hardcoded business rules)
-
-Business logic lives in **three places only**; never in a separate rules engine:
-
-1. **Pydantic schemas** (constraints): `variation_count: int = Field(ge=3, le=4)`.
-2. **Prompt templates** (LLM behavior): "For tech startups, prefer: minimalist, sans-serif, monochrome".
-3. **Tool adapters** (integration logic): Quality checks, retry policies, fallback thresholds.
-
-**Why**: Rules in prompts + schema are easier to test, audit, and modify than a dedicated rules DSL. They stay close to data.
-
----
-
-### 3.6 Decision record: Why NOT a rule engine
-
-**Considered**: Dedicated rules engine (e.g., Drools, Simple Rules) for:
-- Guideline generation rules: `IF (user_industry == "tech") THEN style = "modern"`.
-- Quality gates: `IF (artifact_count > 3) THEN reject_image`.
-
-**Rejected because**:
-1. **Testing overhead**: Pydantic + prompt templates are easier to unit-test than rule interpreter.
-2. **Latency**: Rule interpreter adds 100-200ms of latency; rules live in prompts (co-located with LLM).
-3. **Maintainability**: Rules syntax (e.g., Drools RETE) harder to modify than prompt + schema fields.
-4. **Flexibility**: Hardcoded rules can't adapt to edge cases; LLM reasoning is inherently flexible + can explain reasoning.
-
-**Outcome**: All business rules encoded in:
-- **Pydantic constraints** (hard guardrails).
-- **LLM prompts** (soft heuristics + reasoning).
-- **Tool adapters** (quality checks + fallbacks).
-
----
-
-## 4. Data Schema & API Integration
+## 4. Data Schema and API Integration
 
 ### 4.1 Pydantic models by stage
 
@@ -379,16 +393,19 @@ class BrandContext(BaseModel):
     symbol_preference: List[str] = Field(default_factory=list)
 
 
-class Assumption(BaseModel):
-    key: str
-    value: str
-    reason: str
-
-
-class ClarificationQuestion(BaseModel):
-    key: str
+class SuggestedQuestion(BaseModel):
+    key: Literal["brand_name", "industry"]
     question: str
-    required: bool = False
+
+
+class RequiredFieldState(BaseModel):
+    # Only 2 required fields for POC
+    required_keys: List[str] = Field(default_factory=lambda: [
+        "brand_name",      # Company or product name (MANDATORY)
+        "industry",        # Business category or context (MANDATORY)
+    ])
+    missing_keys: List[str] = Field(default_factory=list)
+    passed: bool = False
 
 
 class DesignGuideline(BaseModel):
@@ -398,14 +415,26 @@ class DesignGuideline(BaseModel):
     typography_direction: List[str]
     icon_direction: List[str]
     constraints: List[str]
-    assumptions: List[Assumption] = Field(default_factory=list)
+
+
+class SessionContextState(BaseModel):
+    session_id: str
+    latest_brand_context: Optional[BrandContext] = None
+    latest_guideline: Optional[DesignGuideline] = None
+    required_field_state: RequiredFieldState = Field(default_factory=RequiredFieldState)
+    generated_option_ids: List[str] = Field(default_factory=list)
 
 
 class LogoGenerateInput(BaseModel):
     session_id: str
     query: str
+    brand_name: Optional[str] = None
+    industry: Optional[str] = None
+    style_preference: List[str] = Field(default_factory=list)
+    color_preference: List[str] = Field(default_factory=list)
+    symbol_preference: List[str] = Field(default_factory=list)
     references: List[ReferenceImage] = Field(default_factory=list)
-    allow_skip_clarification: bool = True
+    use_session_context: bool = True
     variation_count: int = Field(default=4, ge=3, le=4)
     output_format: Literal["png"] = "png"
     output_size: Literal["1024x1024"] = "1024x1024"
@@ -421,132 +450,257 @@ class LogoOption(BaseModel):
 
 class LogoGenerateOutput(BaseModel):
     guideline: DesignGuideline
+    required_field_state: RequiredFieldState
     options: List[LogoOption]
 
 
-class LogoEditInput(BaseModel):
-    session_id: str
-    selected_option_id: str
-    selected_image_url: HttpUrl
-    edit_prompt: str
-    guideline: DesignGuideline
+class JobSubmitResponse(BaseModel):
+    task_id: str
+    status: Literal["queued"]
+    created_at: str  # ISO8601
 
 
-class LogoEditOutput(BaseModel):
-    updated_image_url: HttpUrl
-    edit_summary: str
-    preserved_elements: List[str] = Field(default_factory=list)
-
-
-class StreamEnvelope(BaseModel):
-    request_id: str
-    session_id: str
-    task_type: Literal["logo_analyze", "logo_generate", "logo_edit"]
-    status: Literal["processing", "completed", "failed"]
-    chunk_type: Literal[
-        "reasoning", "clarification", "guideline", "image_option",
-        "edit_result", "suggestion", "warning", "error", "done"
-    ]
-    sequence: int
-    payload: Dict[str, Any] = Field(default_factory=dict)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+class JobStatusResponse(BaseModel):
+    task_id: str
+    status: Literal["queued", "processing", "completed", "failed"]
+    progress_percent: Optional[int] = None  # 0-100 if processing
+    result: Optional[LogoGenerateOutput] = None  # populated when completed
+    error_code: Optional[str] = None  # populated when failed (e.g., MISSING_REQUIRED_FIELDS)
+    error: Optional[str] = None  # populated when failed
+    missing_fields: List[str] = Field(default_factory=list)  # populated when failed
+    suggested_questions: List[SuggestedQuestion] = Field(default_factory=list)  # populated when failed
+    retry_after_seconds: Optional[int] = None  # populated when failed
 ```
 
 Validation rules:
 
 - `query` is required and non-empty after trim.
 - `variation_count` must be 3 or 4.
-- Edit flow requires selected image and edit prompt.
-- If clarification is skipped, guideline must include explicit assumptions.
-
-### 4.2 Where external APIs are called
-
-- LLM API:
-  - `logo_analyze`: intent detection, input understanding, style inference.
-  - `logo_generate`: guideline synthesis and reasoning stream.
-- Vision API (optional):
-  - analyze reference images for style/color/iconography extraction.
-- Image API:
-  - `logo_generate`: generate 3-4 logo options.
-  - `logo_edit`: regenerate selected logo with edit prompt.
+- Required-field gate: brand_name AND industry must both be present before guideline generation.
+- If extraction confidence is **below threshold** (e.g., < 70%), system SHOULD trigger clarification question instead of guessing; this avoids silent failures and improves UX transparency.
+- Merge precedence is fixed: explicit fields in request > extracted fields from new query > stored context for same `session_id`.
+  - **Example:**
+    - User provides `brand_name` explicitly in request → use it
+    - Else, extract `brand_name` from query via LLM
+    - Else, reuse `brand_name` from previous session
+- Empty-value precedence policy:
+  - explicit empty string (e.g., `brand_name=""`) is treated as missing and does not override non-empty extracted/session value.
+  - explicit `null` is treated as "not provided" and falls through to lower-precedence sources.
+  - explicit empty optional lists (e.g., `style_preference=[]`) are valid explicit overrides.
+- If `use_session_context=true`, backend may use stored context as the last precedence layer.
+- If required fields are still missing after merge, return failed job with `error_code`, `missing_fields`, and `suggested_questions`.
+- On `status="failed"` with `error_code="MISSING_REQUIRED_FIELDS"`, `missing_fields` and `suggested_questions` must be populated.
 
 ### 4.3 Concrete endpoint I/O
 
-- `POST /internal/v1/tasks/stream` (`task_type=logo_generate`)
-  - Input:
-    - `query`
-    - `session_id`
-    - `references` (optional)
-    - `variation_count` (optional, 3-4)
-  - Output stream:
-    - `clarification` (if needed)
-    - `reasoning`
-    - `guideline`
-    - `image_option` x 3-4
-    - `suggestion`
-    - `done`
+- `GET /internal/v1/tasks/{task_id}/stream` (SSE stream for Stage A + B)
+  - Behavior:
+    - stream incremental events while extraction and guideline inference are running.
+    - if required fields are missing, emit `clarification` event with `missing_fields` and `suggested_questions`.
+    - FE sends clarification answer and pipeline continues in same task/session.
+    - if guideline is ready, final event includes `generate_hq_task_id` for Stage C polling.
+  - Streaming events are used to render:
+    - "Thinking..." messages
+    - Step-by-step reasoning (Input understanding, style inference, field validation)
+    - Clarification questions
+    - This creates a ChatGPT-like experience where user sees agent's reasoning in real-time.
+  - Streaming event schema:
+    ```json
+    {
+      "type": "thinking | clarification | guideline_ready | error",
+      "step": "extraction | clarification | inference",
+      "content": "string",
+      "metadata": {
+        "task_id": "uuid",
+        "missing_fields": ["brand_name"],
+        "suggested_questions": [{"key": "brand_name", "question": "..."}],
+        "generate_hq_task_id": "uuid-stage-c"
+      }
+    }
+    ```
+  - Example final SSE event (guideline ready):
+    ```json
+    {
+      "type": "guideline_ready",
+      "task_id": "uuid",
+      "generate_hq_task_id": "uuid-stage-c",
+      "guideline": { /* DesignGuideline */ }
+    }
+    ```
 
-- `POST /internal/v1/tasks/stream` (`task_type=logo_edit`)
+- `POST /internal/v1/tasks/{task_id}/clarification` (submit clarification answer)
   - Input:
-    - `session_id`
-    - `selected_option_id`
-    - `selected_image_url`
-    - `edit_prompt`
-    - `guideline`
-  - Output stream:
-    - `reasoning`
-    - `edit_result`
-    - `suggestion`
-    - `done`
+    - `answers` (required, key-value map for missing fields)
+  - Output:
+    ```json
+    {
+      "task_id": "uuid",
+      "status": "processing",
+      "message": "clarification accepted"
+    }
+    ```
 
-- Optional async fallback:
-  - `POST /internal/v1/tasks/submit`
-  - `GET /internal/v1/tasks/{task_id}/status`
+- `POST /internal/v1/tasks/submit` (submit job)
+  - Input:
+    - `task_type` (required: `logo_generate`)
+    - `session_id` (required)
+    - `query` (required: user request for extraction)
+    - `brand_name` (optional explicit override)
+    - `industry` (optional explicit override)
+    - `style_preference` (optional explicit override)
+    - `color_preference` (optional explicit override)
+    - `symbol_preference` (optional explicit override)
+    - `references` (optional: list of ReferenceImage)
+    - `use_session_context` (optional, default true)
+    - `variation_count` (optional, default 4, range 3-4)
+    - `output_format` (optional, default "png")
+    - `output_size` (optional, default "1024x1024")
+  - Output (JobSubmitResponse):
+    ```json
+    {
+      "task_id": "uuid",
+      "status": "queued",
+      "created_at": "2026-03-24T12:00:00Z"
+    }
+    ```
+
+- `GET /internal/v1/tasks/{task_id}/status` (check job status)
+  - Path params: `task_id`
+  - Output (JobStatusResponse, while processing):
+    ```json
+    {
+      "task_id": "uuid",
+      "status": "processing",
+      "progress_percent": 45
+    }
+    ```
+  - Progress mapping (for UI progress bar only, not exposed as detailed steps to user):
+    - 0-20: extraction
+    - 20-40: guideline inference
+    - 40-100: image generation (increment per image completion)
+  - Output (JobStatusResponse, when completed):
+    ```json
+    {
+      "task_id": "uuid",
+      "status": "completed",
+      "result": {
+        "guideline": { /* DesignGuideline */ },
+        "required_field_state": { /* RequiredFieldState */ },
+        "options": [ /* List[LogoOption] */ ]
+      }
+    }
+    ```
+  - Output (JobStatusResponse, if failed):
+    ```json
+    {
+      "task_id": "uuid",
+      "status": "failed",
+      "error_code": "MISSING_REQUIRED_FIELDS",
+      "error": "Missing required fields after merge precedence",
+      "missing_fields": ["brand_name", "industry"],
+      "suggested_questions": [
+        {
+          "key": "brand_name",
+          "question": "What is your company or product name?"
+        },
+        {
+          "key": "industry",
+          "question": "What industry is your business in?"
+        }
+      ],
+      "retry_after_seconds": 60
+    }
+    ```
+  - Context behavior:
+    - merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`
+    - required-field gate uses interactive clarification: missing fields emit stream clarification event and continue in same task/session after FE sends answers
+    - result metadata includes final `required_field_state`
+
+### 4.4 Model benchmark and tracing result
+
+#### 4.4.1 Text models (planning baseline)
+
+| Provider | Model | Input ($/1M) | Output ($/1M) | Typical latency | Role |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| google | gemini-2.5-flash | 0.30 | 2.50 | 2-6s | Primary extraction, clarification, inference |
+| google | gemini-2.5-pro | 1.25 | 10.00 | 4-12s | Higher-depth reasoning fallback |
+| openai | gpt-5.4-nano | 0.20 | 1.25 | 1.5-5s | Cost-sensitive fallback |
+| openai | gpt-5.4-mini | 0.75 | 4.50 | 2-7s | Structured-output fallback |
+| openai | gpt-5.4 | 2.50 | 15.00 | 4-14s | Quality-first fallback |
+
+#### 4.4.2 Image models (tracing result)
+
+Source trace: `logs/model_traces_benchmark_image_v4_tech_startup.json`
+
+| Provider | Model | Status | Latency (ms) | Images requested | Images returned | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| google | gemini-2.5-flash-image | success | 20488 | 3 | 3 | Balanced baseline |
+| google | gemini-3.1-flash-image-preview | success | 47039 | 3 | 3 | Slower preview model |
+| google | gemini-3-pro-image-preview | success | 122664 | 3 | 3 | Slowest in this run |
+| google | imagen-4.0-fast-generate-001 | success | 3961 | 3 | 3 | Fastest in this run |
+| google | imagen-4.0-generate-001 | success | 19674 | 3 | 3 | Quality-oriented alternative |
+| openai | gpt-image-1.5 | success | 30120 | 3 | 3 | Cross-vendor fallback |
+
+#### 4.4.3 Best choice (POC)
+
+- Text primary: `gemini-2.5-flash`
+- Image primary: `imagen-4.0-fast-generate-001`
+- Text fallback: `gpt-5.4-mini`
+- Image fallback: `gpt-image-1.5`
+
+Why this choice:
+
+1. `imagen-4.0-fast-generate-001` is clearly fastest in current tracing run.
+2. `gemini-2.5-flash` gives strong speed/cost balance for extraction and clarification.
+3. OpenAI fallback keeps multi-provider resilience for production incidents.
 
 ---
 
-## 5. Risks & Open Issues
+## 5. Risks and open issues
 
 ### 5.1 Latency
 
 Risk:
 
-- Generating 3-4 images may exceed p95 target.
+- Job completion may exceed p95 target depending on provider queue and image generation latency.
 
 Mitigation:
 
-- Emit reasoning early for visible progress.
-- Parallel generation when provider supports it.
-- Timeout and single retry for transient failures.
-- Near-timeout fallback from 4 options to 3.
+- Parallel image generation where provider permits.
+- Timeout + retry for transient provider failures.
+- Queue scaling policy when backlog grows.
+- Circuit breaker for provider outages.
 
-### 5.2 Generation quality
+### 5.2 Required-field validation quality
 
 Risk:
 
-- Outputs may drift from guideline or contain artifacts (noise, broken text, pixelation).
+- User intent may not include brand_name or industry explicitly; fail-fast may increase first-attempt failure rate.
 
 Mitigation:
 
-- Apply `quality_flags` per option.
-- Keep guideline-first prompt template consistent.
-- Return warning + next edit suggestion when quality is below expectation.
+- Extract brand_name and industry early (Step 2) with high-confidence NLP.
+- Return structured failure payload (`error_code`, `missing_fields`, `suggested_questions`) for FE-guided resubmission.
+- Prioritize targeted suggested questions (e.g., "What is your company name?" before "What industry?").
+- Allow inference from context (e.g., "design a logo for a fintech startup" → industry=fintech).
 
 ### 5.3 Cost
 
 Risk:
 
-- Cost growth from combined LLM + image generation + iterative edits.
+- Failed attempts (missing required fields) and 3-4 image outputs increase cost per successful request.
 
 Mitigation:
 
-- Track cost per `request_id` and `session_id`.
-- Limit edit attempts in POC defaults.
-- Reuse guideline/context inside session to reduce unnecessary calls.
+- Track cost per `task_id` and `session_id`.
+- Cache extracted context in session and avoid redundant re-analysis.
+- Keep benchmark table refreshed each milestone.
 
 ### 5.4 Open technical decisions
 
-- Primary frontend streaming protocol for production: NDJSON or gRPC stream.
-- TTL and signed URL policy for image assets.
-- Whether deterministic seed is required for edit consistency.
-- Quality gate policy: hard fail vs soft warning.
+- SSE transport policy: heartbeat interval, reconnect strategy, and stream timeout policy.
+- Signed URL TTL policy by asset type.
+- Job result retention: how long to keep completed job results available.
+- Session context TTL and reset policy (auto expiry only vs manual reset endpoint).
+- Default guideline style when `style_preference` is not provided (infer from industry vs hardcoded default).
+- Fallback generation model if primary `gemini-3.1-flash-image-preview` fails mid-job.
