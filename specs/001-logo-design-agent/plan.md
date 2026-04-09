@@ -31,19 +31,23 @@
 
 Step 1: Frontend (Data Initialization)
 1. User clicks a detail on the generated logo.
-2. FE runs SAM in background and creates `Mask_Image` (white/black).
-3. User enters edit instruction, for example: "Turn this shape into a fire dragon".
-4. FE calls `POST /edit` with 3 payloads:
-- `Original_Image` (base64 or URL)
-- `Mask_Image` (base64 or URL)
-- `Raw_Prompt`
+2. FE runs SAM in background and creates Mask_Image (white/black).
+3. FE setup note:
+- Install once in web-ui: npm install onnxruntime-web.
+- Load SAM ONNX weights when Edit page opens (or lazy-load on first click).
+- Inference runs directly in browser (WebAssembly/WebGPU path), not on backend.
+4. User enters edit instruction, for example: "Turn this shape into a fire dragon".
+5. FE calls POST /edit with 3 payloads:
+- Original_Image (base64 or URL)
+- Mask_Image (base64 or URL)
+- Raw_Prompt
 
 Step 2: Backend (Inpainting Execution)
 1. BE calls an image edit/inpainting API.
 2. Request payload:
-- `image`: `Original_Image`
-- `mask`: `Mask_Image`
-- `prompt`: `Raw_Prompt`
+- image: Original_Image
+- mask: Mask_Image
+- prompt: Raw_Prompt
 3. Model behavior:
 - Keep 100% of black-mask pixels unchanged.
 - Regenerate white-mask region using diffusion/inpainting process.
@@ -52,26 +56,37 @@ Step 2: Backend (Inpainting Execution)
 ### 3.2 Case 2 - Minimal Edit (1 image + 1 prompt)
 
 Step 1: Frontend
-1. FE sends only `Original_Image` and `Raw_Prompt`.
+1. FE sends only Original_Image and Raw_Prompt.
 
 Step 2: Backend
 1. BE calls image edit/generation model with image+prompt.
-2. BE injects preservation instruction (keep layout/style where possible).
-3. Return edited image and trace metadata.
+2. Recommended strong models for this mode:
+- Gemini 2.5 Flash Image / Gemini 3 Flash Image (Nano Banana 2)
+- OpenAI gpt-image-1.5 (or best available image-edit model)
+3. Why no explicit mask is needed (short version):
+- The model understands the prompt semantically (for example, identifies text regions).
+- Internal attention acts like an implicit mask (not exposed to FE/BE).
+- Diffusion updates target regions while attempting to preserve non-target content.
+4. BE injects preservation instruction (keep layout/style where possible).
+5. Return edited image and trace metadata.
 
 ### 3.3 Case 3 - Source + Crop + Prompt (Mask generated in BE)
 
 Step 1: Frontend
 1. FE sends 3 inputs:
-- `Original_Image`
-- `Crop_Image` (bounding-box crop of target region)
-- `Raw_Prompt`
+- Original_Image
+- Crop_Image (bounding-box crop of target region)
+- Raw_Prompt
 
 Step 2: Backend
 1. Locate crop region against original image.
-2. Convert crop region to backend-generated binary mask.
+2. Run SAM (or another segmenter) in backend to convert crop region into a binary mask.
 3. Run inpainting with `Original_Image` + generated mask + `Raw_Prompt`.
 4. Return edited image, optional debug mask, and trace metadata.
+
+Implementation note:
+- Yes, Case 3 is similar to Case 1, but FE does not send mask.
+- The extra backend step is SAM-based mask generation/refinement from crop input.
 
 ---
 
