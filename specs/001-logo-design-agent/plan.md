@@ -1,145 +1,197 @@
-# Implementation Plan: AI Logo Design Agent (POC Phase 1)
+# Image Editing Phase Template - Logo Design
 
-**Branch**: `001-logo-design-agent` | **Date**: 2026-03-22 | **Spec**: `specs/001-logo-design-agent/spec.md`
-**Input**: Feature specification from `/specs/001-logo-design-agent/spec.md`
+## 0) Metadata
+- Project:
+- Owner:
+- Date:
+- Version:
+- Scope: Logo editing workflow
+- Status: Draft | In Review | Approved
 
-## Summary
+---
 
-Deliver a 4-week POC for conversational logo creation with explicit reasoning visibility, guideline-first generation, and prompt-based selected-logo editing. This plan is synchronized with the active Beads graph (`SpecLedger-7ij`), includes explicit foundational observability gating (`SpecLedger-i8l`), and aligns with refined spec wording for FR-014 visual quality checks and deterministic NFR-003 skip/default behavior.
+## 1) Phase Objective
+- Enable controlled edits on generated logos.
+- Prioritize region accuracy, output consistency, and response speed.
+- Capture measurable metrics for latency, cost, quality, and user satisfaction.
 
-## Technical Context
+---
 
-**Language/Version**: Python 3.11 (backend), TypeScript 18+ (frontend)  
-**Primary Dependencies**: ai-hub-sdk, FastAPI, Pydantic v2, grpcio/protobuf, Redis client, OpenTelemetry, Langfuse SDK, Next.js  
-**Storage**: Redis (session/state), provider-hosted object URLs for generated assets  
-**Testing**: pytest (contract/integration/unit), Playwright (smoke E2E), proto contract validation  
-**Target Platform**: Linux containerized backend/workers + modern browser frontend  
-**Project Type**: web (backend + frontend + worker services)  
-**Performance Goals**: p95 first reasoning chunk <= 1.5s; p95 request-to-3/4-logo completion <= 25s; failure response emission <= 3s  
-**Constraints**: single-model generation in Phase 1; no region editing; no multi-model routing; no auto-evaluation; single-session scope; strict MCP envelope validation  
-**Scale/Scope**: internal POC and small pilot usage (tens of concurrent sessions)
+## 2) Case 1 - Masked Inpainting Pipeline
+### Stage 1 - Frontend Mask Creation (Object Selection)
 
-## Constitution Check
+#### 2.1 Purpose
+Help users select the exact region to edit without heavy manual painting.
 
-*GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
+#### 2.2 Model
+- Segment Anything Model (SAM) by Meta.
+- Browser-optimized variants: MobileSAM or SAM-b.
+- Runtime recommendation: ONNX + WebAssembly via onnxruntime-web.
 
-Verify compliance with principles from `.specify/memory/constitution.md`:
+#### 2.3 System Handling
+1. Background preload: load SAM when Edit view opens.
+2. Point capture: when user clicks on the logo, capture click coordinates $(X, Y)$.
+3. Mask inference: feed $(X, Y)$ into SAM to infer object boundaries.
+4. Binary mask output (same size as source image):
+- White: editable region.
+- Black: protected region.
+5. Fallback tool: provide Brush/Eraser on HTML5 Canvas so users can refine the mask manually.
 
-- [x] **Specification-First**: Spec.md complete with prioritized user stories and measurable requirement refinements
-- [x] **Test-First**: Contract and integration tests are explicit gates before implementation-heavy story tasks
-- [x] **Code Quality**: Strict schema validation and boundary checks are specified in model/contracts/tasks
-- [x] **UX Consistency**: 8-step flow and independent story acceptance scenarios preserved
-- [x] **Performance**: Technical context and NFR-004 define measurable p95 targets
-- [x] **Observability**: Foundational observability baseline task (`SpecLedger-i8l`) now blocks US1/US2/US3
-- [x] **Issue Tracking**: Active epic `SpecLedger-7ij` linked to all phase features and tasks with spec labels
+#### 2.4 Input / Output
+- Input:
+- Source image
+- Click points or brush strokes
+- Output:
+- Binary mask PNG (white editable area, black preserved area)
 
-**Complexity Violations**:
-- None
+#### 2.5 Acceptance Criteria
+- Mask IoU against expected region >= [ ]
+- Mask generation latency <= [ ] ms
+- Brush fallback works on desktop and mobile
 
-## Previous Work
+### Stage 2 - Backend Inpainting (3-part Input)
 
-- `SpecLedger-4cx` (closed): Technical design document used as historical reference.
-- `SpecLedger-ct8` (closed): Earlier scope exploration captured and superseded by current POC constraints.
-- `SpecLedger-fxv` (closed): Legacy graph superseded by current execution graph.
-- Active graph: `SpecLedger-7ij` with phase features:
-  - `SpecLedger-xgg` (Setup)
-  - `SpecLedger-075` (Foundational + Test Gate)
-  - `SpecLedger-j4k` (US1)
-  - `SpecLedger-1pf` (US2)
-  - `SpecLedger-fkz` (US3)
-  - `SpecLedger-1xy` (Polish)
-- Recent alignment updates:
-  - Added foundational observability baseline `SpecLedger-i8l` (T027) and set it as explicit blocker for US1/US2/US3.
-  - Refined spec wording for FR-014 and NFR-003 and promoted spec status to Ready for Planning.
+#### 2.6 Purpose
+Regenerate only the selected region while preserving everything else.
 
-## Phase 0: Research Output
+#### 2.7 Input
+1. Source image
+2. Mask image (binary white/black)
+3. Text prompt
 
-Generated/validated `research.md` with clarified planning decisions:
+#### 2.8 Model Options
+- Open-source (self-hosted):
+- SDXL Inpainting
+- FLUX.1 Fill
+- Commercial APIs:
+- Google Imagen Inpainting
+- OpenAI image edit endpoint (model support depends on endpoint)
 
-- Test-first as enforceable execution gate (not policy-only).
-- Explicit MCP envelope compliance at external boundaries.
-- Single-model generation retained for Phase 1.
-- Measurable performance targets retained for validation.
-- Out-of-scope guardrails retained to prevent scope creep.
+#### 2.9 System Handling
+1. Frontend sends source image, mask image, and prompt to backend.
+2. Backend calls selected inpainting model/provider.
+3. Masking constraints:
+- Black region: preserve original pixels.
+- White region: regenerate content from prompt.
+4. Seamless blending on mask edges to match lighting, shadows, and texture.
 
-All planning clarifications resolved; no unresolved NEEDS CLARIFICATION markers remain.
+#### 2.10 Output
+- Edited image
+- Trace metadata: model, latency, cost estimate, resolution, request id
 
-## Phase 1: Design and Contracts Output
+#### 2.11 Acceptance Criteria
+- Pixel drift outside mask <= [ ]%
+- Change quality inside mask meets UX threshold >= [ ]
+- p95 latency <= [ ] s
 
-Generated/validated artifacts:
+---
 
-- `research.md`
-- `data-model.md`
-- `contracts/agent.proto`
-- `contracts/worker.proto`
-- `quickstart.md`
+## 3) Case 2 - Minimal Prompt Edit (1 Image + 1 Prompt)
 
-Synchronization applied for latest requirement wording:
+#### 3.1 Purpose
+Fast edit flow when user does not need explicit masking.
 
-- FR-014 now interpreted as measurable output-quality criteria (resolution + artifact checks + guideline consistency).
-- NFR-003 now interpreted as deterministic skip/default behavior with explicit user-visible assumption disclosure.
-- Foundational observability bootstrap is treated as pre-story gate in execution sequencing.
+#### 3.2 Input
+1. Source image
+2. Text prompt
 
-## Project Structure
+#### 3.3 System Handling
+1. Send image + prompt to edit/generation model.
+2. Add instruction to preserve layout and modify only requested details.
+3. Return edited image and metadata.
 
-### Documentation (this feature)
+#### 3.4 Risks
+- Broader changes may happen without mask constraints.
+- Often requires multiple candidates and ranking.
 
-```text
-specs/001-logo-design-agent/
-├── plan.md
-├── research.md
-├── data-model.md
-├── quickstart.md
-├── contracts/
-│   ├── agent.proto
-│   └── worker.proto
-└── tasks.md
-```
+#### 3.5 Acceptance Criteria
+- Layout preservation >= [ ]
+- First-pass user acceptance rate >= [ ]
 
-### Source Code (repository root)
+---
 
-```text
-backend/
-├── src/
-│   ├── api/
-│   ├── models/
-│   ├── orchestrator/
-│   ├── services/
-│   └── workers/
-└── tests/
-    ├── contract/
-    ├── integration/
-    └── unit/
+## 4) Case 3 - Bounding Box Edit (Original Image + Region Box + Prompt)
 
-frontend/
-├── src/
-│   ├── components/
-│   ├── pages/
-│   └── services/
-└── tests/
-```
+#### 4.1 Purpose
+Simplify user interaction by selecting a rectangular region instead of full mask painting.
 
-**Structure Decision**: Web split (backend + frontend + worker runtime) is retained to support streaming interactions, async execution, and clean MCP/service boundaries under the 4-week POC constraint.
+#### 4.2 Input
+1. Original image
+2. Bounding-box image or box coordinates
+3. Prompt
 
-## Agent Context Update
+#### 4.3 System Handling
+1. Convert bounding box to temporary mask (hard rectangle or soft edge).
+2. Optionally refine box-to-mask using SAM or GrabCut.
+3. Run inpainting on the masked region.
 
-Executed:
+#### 4.4 Technical Notes
+- Large bounding boxes reduce edit precision.
+- Optional feather edge [ ] px usually improves blending quality.
 
-```bash
-.specify/scripts/bash/update-agent-context.sh claude
-```
+---
 
-Agent context updated with active plan stack and preserved manual sections.
+## 5) Benchmark Framework (Latency, Cost, Quality, UX)
 
-## Post-Design Constitution Re-check
+### 5.1 Benchmark Goals
+- Compare model behavior for logo-editing use cases.
+- Choose default model per edit type and SLA target.
 
-- [x] Specification-first enforced with refined measurable requirements in spec.
-- [x] Test-first gates remain explicit in foundational and story sequencing.
-- [x] MCP boundary compliance remains mandatory in contracts and runtime validation.
-- [x] Observability-by-design strengthened by foundational baseline gate (`SpecLedger-i8l`).
-- [x] Performance targets remain measurable and mapped to validation tasks.
-- [x] Fail-fast behavior remains captured in error mapping and retry guidance tasks.
+### 5.2 Benchmark Matrix
+| Provider | Model | Edit Mode | Main Edit Type | Input Type | Input Resolution | Output Resolution | Latency p50 (ms) | Latency p95 (ms) | Cost/Request (USD) | Success Rate (%) | User Rating (1-5) | Notes |
+|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---|
+| OpenAI | gpt-image-1 | no-mask | text recolor | image+prompt |  |  |  |  |  |  |  |  |
+| OpenAI | gpt-image-1.5 | no-mask | text recolor | image+prompt |  |  |  |  |  |  |  |  |
+| Provider X | Inpaint Model Y | mask | local object replace | image+mask+prompt |  |  |  |  |  |  |  |  |
 
-## Complexity Tracking
+### 5.3 Tracing Schema Per Request
+- request_id
+- timestamp_utc
+- provider
+- model
+- edit_mode: mask | no-mask | bbox
+- input_resolution
+- output_resolution
+- latency_ms
+- token_or_compute_usage
+- estimated_cost_usd
+- success
+- error_type
+- user_feedback_score
+- user_feedback_comment
 
-No constitution violations requiring justification.
+### 5.4 Quality Evaluation Buckets
+- Preservation score: how well layout and brand identity are kept.
+- Edit fidelity: how accurately output follows prompt in target region.
+- Typography integrity: readability and correctness of edited text.
+- Seam quality: visual continuity at edited boundaries.
+
+### 5.5 Quick Rubric
+| Metric | Definition | Scale | Target |
+|---|---|---|---|
+| Preservation | Keep non-edited content consistent | 1-5 | >= 4 |
+| Prompt fidelity | Match requested change | 1-5 | >= 4 |
+| Visual quality | Sharpness, artifacts, color quality | 1-5 | >= 4 |
+| Brand consistency | Keep logo style coherent | 1-5 | >= 4 |
+
+---
+
+## 6) Rollout Recommendation
+- Phase 1: Ship image+prompt flow to collect fast feedback.
+- Phase 2: Add mask-assisted inpainting for high-precision edits.
+- Phase 3: Optimize bbox-to-mask conversion and model auto-routing.
+
+---
+
+## 7) Decision Log
+| Date | Decision | Owner | Reason | Impact |
+|---|---|---|---|---|
+|  |  |  |  |  |
+
+---
+
+## 8) Open Questions
+- Which model should be default for text edits in logos?
+- Do we need multi-candidate ranking before final output?
+- What is acceptable cost/request threshold?
+- Should mask be mandatory for small or dense typography?
