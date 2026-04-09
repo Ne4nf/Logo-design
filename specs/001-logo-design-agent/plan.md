@@ -90,162 +90,69 @@ Implementation note:
 
 ---
 
-## 2) Case 1 - Masked Inpainting Pipeline
-### Stage 1 - Frontend Mask Creation (Object Selection)
+## 5) Image Models Benchmark
 
-#### 2.1 Purpose
-Help users select the exact region to edit without heavy manual painting.
+### 5.1 Image Models
+| Name | Latest Version | Pricing | Average Cost | Average Latency (second) | Correlation between latency and output token | Recommend UseCase | Context window | Note |
+|---|---|---|---|---|---|---|---|---|
+| OpenAI gpt-image-1 |  |  |  |  |  | Case 2 - minimal edit |  |  |
+| OpenAI gpt-image-1.5 |  |  |  |  |  | Case 2 - minimal edit |  |  |
+| OpenAI / other inpaint model |  |  |  |  |  | Case 1 / Case 3 - masked edit |  |  |
 
-#### 2.2 Model
-- Segment Anything Model (SAM) by Meta.
-- Browser-optimized variants: MobileSAM or SAM-b.
-- Runtime recommendation: ONNX + WebAssembly via onnxruntime-web.
+### 5.2 Image Models Benchmark
+#### Dataset
 
-#### 2.3 System Handling
-1. Background preload: load SAM when Edit view opens.
-2. Point capture: when user clicks on the logo, capture click coordinates $(X, Y)$.
-3. Mask inference: feed $(X, Y)$ into SAM to infer object boundaries.
-4. Binary mask output (same size as source image):
-- White: editable region.
-- Black: protected region.
-5. Fallback tool: provide Brush/Eraser on HTML5 Canvas so users can refine the mask manually.
+#### Dataset Overview
 
-#### 2.4 Input / Output
-- Input:
-- Source image
-- Click points or brush strokes
-- Output:
-- Binary mask PNG (white editable area, black preserved area)
+| ID | Image Model Benchmark Result |
+|---|---|
+| 1 |  |
 
-#### 2.5 Acceptance Criteria
-- Mask IoU against expected region >= [ ]
-- Mask generation latency <= [ ] ms
-- Brush fallback works on desktop and mobile
+**Testcase:**
 
-### Stage 2 - Backend Inpainting (3-part Input)
+**Testcase explanation**
 
-#### 2.6 Purpose
-Regenerate only the selected region while preserving everything else.
+**Input**
 
-#### 2.7 Input
-1. Source image
-2. Mask image (binary white/black)
-3. Text prompt
+| Input |  |
+|---|---|
+| Model |  |
+| Output |  |
 
-#### 2.8 Model Options
-- Open-source (self-hosted):
-- SDXL Inpainting
-- FLUX.1 Fill
-- Commercial APIs:
-- Google Imagen Inpainting
-- OpenAI image edit endpoint (model support depends on endpoint)
+**Result**
 
-#### 2.9 System Handling
-1. Frontend sends source image, mask image, and prompt to backend.
-2. Backend calls selected inpainting model/provider.
-3. Masking constraints:
-- Black region: preserve original pixels.
-- White region: regenerate content from prompt.
-4. Seamless blending on mask edges to match lighting, shadows, and texture.
+| Result |  |
+|---|---|
+|  |  |
 
-#### 2.10 Output
-- Edited image
-- Trace metadata: model, latency, cost estimate, resolution, request id
+| ID | Image Model Benchmark Result |
+|---|---|
+| 2 |  |
 
-#### 2.11 Acceptance Criteria
-- Pixel drift outside mask <= [ ]%
-- Change quality inside mask meets UX threshold >= [ ]
-- p95 latency <= [ ] s
+**Testcase:**
 
----
+**Testcase explanation**
 
-## 3) Case 2 - Minimal Prompt Edit (1 Image + 1 Prompt)
+**Input**
 
-#### 3.1 Purpose
-Fast edit flow when user does not need explicit masking.
+| Text Input |  |
+|---|---|
+| Image Input |  |
+| Model |  |
+| Output |  |
 
-#### 3.2 Input
-1. Source image
-2. Text prompt
+**Result**
 
-#### 3.3 System Handling
-1. Send image + prompt to edit/generation model.
-2. Add instruction to preserve layout and modify only requested details.
-3. Return edited image and metadata.
+| Result |  |
+|---|---|
+|  |  |
 
-#### 3.4 Risks
-- Broader changes may happen without mask constraints.
-- Often requires multiple candidates and ranking.
+### Benchmark Note
+- Use the same source image set across all models.
+- Record prompt, resolution, latency, and user feedback for each run.
+- For Case 1 and Case 3, store the generated mask path as trace data.
+- For Case 2, note any unexpected layout drift or over-editing.
 
-#### 3.5 Acceptance Criteria
-- Layout preservation >= [ ]
-- First-pass user acceptance rate >= [ ]
-
----
-
-## 4) Case 3 - Bounding Box Edit (Original Image + Region Box + Prompt)
-
-#### 4.1 Purpose
-Simplify user interaction by selecting a rectangular region instead of full mask painting.
-
-#### 4.2 Input
-1. Original image
-2. Bounding-box image or box coordinates
-3. Prompt
-
-#### 4.3 System Handling
-1. Convert bounding box to temporary mask (hard rectangle or soft edge).
-2. Optionally refine box-to-mask using SAM or GrabCut.
-3. Run inpainting on the masked region.
-
-#### 4.4 Technical Notes
-- Large bounding boxes reduce edit precision.
-- Optional feather edge [ ] px usually improves blending quality.
-
----
-
-## 5) Benchmark Framework (Latency, Cost, Quality, UX)
-
-### 5.1 Benchmark Goals
-- Compare model behavior for logo-editing use cases.
-- Choose default model per edit type and SLA target.
-
-### 5.2 Benchmark Matrix
-| Provider | Model | Edit Mode | Main Edit Type | Input Type | Input Resolution | Output Resolution | Latency p50 (ms) | Latency p95 (ms) | Cost/Request (USD) | Success Rate (%) | User Rating (1-5) | Notes |
-|---|---|---|---|---|---|---|---:|---:|---:|---:|---:|---|
-| OpenAI | gpt-image-1 | no-mask | text recolor | image+prompt |  |  |  |  |  |  |  |  |
-| OpenAI | gpt-image-1.5 | no-mask | text recolor | image+prompt |  |  |  |  |  |  |  |  |
-| Provider X | Inpaint Model Y | mask | local object replace | image+mask+prompt |  |  |  |  |  |  |  |  |
-
-### 5.3 Tracing Schema Per Request
-- request_id
-- timestamp_utc
-- provider
-- model
-- edit_mode: mask | no-mask | bbox
-- input_resolution
-- output_resolution
-- latency_ms
-- token_or_compute_usage
-- estimated_cost_usd
-- success
-- error_type
-- user_feedback_score
-- user_feedback_comment
-
-### 5.4 Quality Evaluation Buckets
-- Preservation score: how well layout and brand identity are kept.
-- Edit fidelity: how accurately output follows prompt in target region.
-- Typography integrity: readability and correctness of edited text.
-- Seam quality: visual continuity at edited boundaries.
-
-### 5.5 Quick Rubric
-| Metric | Definition | Scale | Target |
-|---|---|---|---|
-| Preservation | Keep non-edited content consistent | 1-5 | >= 4 |
-| Prompt fidelity | Match requested change | 1-5 | >= 4 |
-| Visual quality | Sharpness, artifacts, color quality | 1-5 | >= 4 |
-| Brand consistency | Keep logo style coherent | 1-5 | >= 4 |
 
 ---
 
