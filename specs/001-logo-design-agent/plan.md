@@ -93,11 +93,20 @@ Implementation note:
 ## 5) Image Models Benchmark
 
 ### 5.1 Image Models
-| Name | Latest Version | Pricing | Average Cost | Average Latency (second) | Correlation between latency and output token | Recommend UseCase | Context window | Note |
-|---|---|---|---|---|---|---|---|---|
-| OpenAI gpt-image-1 |  |  |  |  |  | Case 2 - minimal edit |  |  |
-| OpenAI gpt-image-1.5 |  |  |  |  |  | Case 2 - minimal edit |  |  |
-| OpenAI / other inpaint model |  |  |  |  |  | Case 1 / Case 3 - masked edit |  |  |
+| Name | Pricing | Average Cost | Average Latency (second) | Correlation between latency and output token | Recommend UseCase | Case Fit | Note |
+|---|---|---|---|---|---|---|---|
+| google/gemini-2.5-flash-image (Nano Banana) | $30 / 1M output tokens; each 1024x1024 image ~ 1,290 tokens (~$0.039/image) | $0.039 (1024px) | ~6s | Positive - latency grows with output token count | Low-cost bulk generation, rapid prototyping, high-throughput creation | Case 2 | Free tier exists with rate limits; some users report occasional resolution downscaling |
+| google/gemini-3.1-flash-image-preview (Nano Banana 2) | ~$0.045-$0.151/image depending on resolution; 1024px around $0.067 | $0.067 (1024px) | 23-56s (avg ~37.6s) | Weak/unclear correlation in real-world tests | High-quality premium generation, larger-resolution marketing assets | Case 2 | Preview-phase variability and compute pressure can increase latency |
+| google/gemini-3-pro-image-preview (Nano Banana Pro) | ~$0.02-$0.08/image | ~$0.05 (mid-tier) | 3-12s | Latency increases with higher resolution | Professional-grade quality, stronger text rendering, high-res brand graphics | Case 2 | Supports up to 4K-class outputs in provider docs |
+| openai/gpt-image-1 | Tiered pricing: Low $0.011, Medium $0.042, High $0.167 per image | $0.042 (medium) | ~45-50s | Higher quality tiers usually increase latency | General-purpose generation/editing where flexibility matters | Case 2 | Token-based billing may apply in some API modes |
+| openai/gpt-image-1.5 | Tiered pricing: Low $0.009-$0.052, Medium $0.034-$0.051, High $0.133-$0.200 | $0.034 (medium) | 15-45s | Latency increases with quality tier | Premium marketing edits, stronger prompt adherence, high-fidelity outputs | Case 2 | Commonly faster than gpt-image-1 with improved instruction following |
+| black-forest-labs/flux-fill-pro | Fixed ~$0.05 per execution | $0.05/image | ~9s | Minimal - fixed-size inpainting workloads are relatively stable | Inpainting, local replacement, content-aware fill | Case 1, Case 3 | Good fit for production edit pipelines |
+| black-forest-labs/flux-kontext-pro | ~$0.04/image (provider-level) | $0.04/image | ~7s | Low sensitivity to token-like factors; tuned for edit speed | Fast iterative editing with strong content preservation | Case 2, Case 3 | Good trade-off for interactive design tools |
+| black-forest-labs/flux-kontext-max | ~$0.08/image (premium) | $0.08/image | Not publicly disclosed | N/A | Highest-fidelity editing, final-asset polishing | Case 2, Case 3 | Premium tier focused on quality over cost |
+| black-forest-labs/flux-kontext-dev | ~$0.025/image (dev/open-weight tier) | $0.025/image | N/A (public data limited) | N/A | Development, experimentation, low-cost testing | Case 2 (R&D), Case 3 (R&D) | Often non-commercial or restricted license depending on channel |
+| prunaai/flux-kontext-fast | ~$0.005/image (provider listing) | $0.005/image | Sub-second to few seconds (typical 1024px claims) | Latency usually scales with resolution/steps | Real-time creative apps, low-latency web experiences | Case 2 | Very cost-effective for interactive prototyping |
+| black-forest-labs/flux-2-flex | ~$0.06/image | $0.06/image | ~13s | Scales with diffusion steps and resolution | Balanced quality/speed for production workflows | Case 2, Case 3 | Tunable quality-speed trade-off |
+| black-forest-labs/flux-2-dev | ~$0.025/image | $0.025/image | N/A (public data limited) | N/A | Open-weight experimentation and custom training workflows | Case 2 (R&D), Case 3 (R&D) | Self-host option possible with licensing constraints |
 
 ### 5.2 Image Models Benchmark
 #### Dataset
