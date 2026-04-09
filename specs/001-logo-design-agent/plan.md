@@ -17,6 +17,15 @@
 
 ---
 
+## 2) Three Editing Cases (Comparison Table)
+
+| Case | Purpose | Frontend Input | Backend Handling | Output | Key Risks |
+|---|---|---|---|---|---|
+| Case 1: FE Mask + BE Inpainting | Precise local edit with clear protected area | 1) Source image, 2) Binary mask (white/black), 3) Prompt | Inpainting model edits white region and preserves black region; blends edges | Edited image + trace metadata | Wrong mask quality, boundary artifacts |
+| Case 2: Minimal Edit (No Mask) | Fast editing with lowest UI complexity | 1) Source image, 2) Prompt | Edit/generation model receives image+prompt only; no hard mask constraint | Edited image + trace metadata | Over-editing outside target area |
+| Case 3: Crop-guided Edit (Mask generated in BE) | Keep FE simple while still using mask constraints | 1) Source image, 2) Bounding-box crop image, 3) Prompt | BE derives mask from crop image against source, then runs inpainting with source+mask+prompt | Edited image + generated mask + trace metadata | Crop too loose/tight, mask derivation errors |
+
+
 ## 2) Case 1 - Masked Inpainting Pipeline
 ### Stage 1 - Frontend Mask Creation (Object Selection)
 
