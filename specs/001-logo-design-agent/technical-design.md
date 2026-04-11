@@ -1,413 +1,938 @@
-# Logo Design AI Technical Design (source_v2 + Edit Full Flow)
-
-## 0. Metadata
-- Project: Logo Design AI
-- Owner: Logo-design team
-- Date: 2026-04-11
-- Version: 2.0 (source_v2 aligned)
-- Status: In Review
-- Scope: End-to-end logo generation and image editing workflow
-
----
+# Logo Design AI - Technical Design (source_v2)
 
 ## 1. Overview
 
 ### 1.1 Objective
 
-Refactor technical design to match `source_v2` tool-first DAG runtime and extend the full flow with image editing loop.
-
-Current implementation baseline:
-- Generation flow is implemented in `source_v2` (intent -> extract -> clarification -> research -> guideline -> generate).
-- Clarification pause/resume with session state is implemented.
-- Stream-first execution is implemented.
-
-Design extension in this document:
-- Add Step 7 image editing flow (mask/no-mask/crop-guided) and follow-up loop.
-- Define benchmark plan for text planning models and image generation/edit models.
-
-### 1.2 Scope
+Build a logo generation and editing backend using a **tool-first DAG orchestration runtime** (`source_v2`). The system plans, executes, and streams structured results through a reusable tool registry, an iterative DAG planner, and an executor with interpolation middleware.
 
 In-scope:
-- Step 1: Intent detection.
-- Step 2: Input extraction and reference handling.
-- Step 2.5: Web research enrichment.
-- Step 3: Clarification gate and iterative clarification loop.
-- Step 4: Guideline generation.
-- Step 6: Logo generation.
-- Step 7: Image editing loop design (integrated full flow design).
 
-Out-of-scope for current codebase runtime:
-- Step 8 production-grade follow-up intelligence ranking.
-- Long-term persistent session store and cross-process recovery.
+- Intent detection and brand context extraction.
+- Required-field gate and clarification loop with pause/re-plan.
+- Web research enrichment for logo domain.
+- Per-concept design guideline inference.
+- Parallel logo option generation.
+- **Image editing phase** — 3 editing cases (FE Mask + BE Inpainting, Minimal Edit, Crop-guided Edit).
 
-### 1.3 Success Targets
+Out-of-scope:
 
-- >= 90% requests collect required fields (`brand_name`, `industry`) before generation.
-- >= 90% gate-passed requests produce valid guideline payload.
-- >= 85% requests return valid option payload.
-- p95 end-to-end generation <= 40s in current runtime target.
-- Edit flow p95 target:
-  - Case 2 (no-mask edit): <= 25s.
-  - Case 1 or 3 (mask-based): <= 30s.
-- All failures return actionable `error_code` and `error_message`.
+- Follow-up suggestion intelligence (Step 8).
+- Multi-domain intent classifier.
+- Production queue-decoupled deployment.
 
----
+### 1.2 Success metrics
 
-## 2. source_v2 Architecture
+| Metric | Target |
+|:---|:---|
+| Requests that extract or clarify `brand_name` + `industry` before generation | >= 90% |
+| Requests past required-field gate that produce valid guideline | >= 90% |
+| Requests returning valid options payload | >= 85% |
+| p95 stream end-to-end completion (generate flow) | <= 40s |
+| Edit-flow single-image turnaround (Case 2) | <= 15s |
+| On failure, return actionable `error_code` and `error_message` | 100% |
 
-### 2.1 Design Principles
+### 1.3 User journey (full flow including edit)
 
-- Tool-first orchestration: each capability is a typed tool with explicit input/output schema.
-- DAG-driven planning: planner emits executable node graph, executor resolves dependencies.
-- Runtime-safe interpolation: `${...}` binding is resolved at execution time from runtime state.
-- Iterative planning: clarification can pause execution and re-plan a post-clarification DAG segment.
-- Fail-closed behavior: invalid DAG, unresolved bindings, and tool failures stop execution with explicit error.
-- Payload budget safety: large final result can be returned as `options_ref` artifact instead of full inline body.
+1. User submits query with optional explicit fields and references.
+2. System streams DAG execution chunks (intent → extract → gate).
+3. If required fields are missing, system emits `clarification_needed` and pauses.
+4. User answers; system re-plans with post-clarification DAG (research → guideline → generate).
+5. System returns completed payload with 3 logo options.
+6. **User selects a logo and enters edit instruction** (with optional mask or crop).
+7. System runs edit DAG → calls image edit API → updates DESIGN.md if style changed → returns edited image.
+8. System suggests follow-up edits. User can loop back to step 6 or finish.
 
-### 2.2 Runtime Modules
+### 1.4 Technical constraints
 
-| Module | Responsibility |
-| :--- | :--- |
-| `source_v2/agents/logo_creator_agent.py` | High-level facade, tool registry wiring, runner bootstrap |
-| `source_v2/agents/runner.py` | Stream orchestration, planning loop, pause/resume, session versioning |
-| `source_v2/planner/planner_tool.py` | LLM plan generation, semantic guardrails, fallback template DAG |
-| `source_v2/planner/dag_validator.py` | DAG validation (duplicate IDs, unknown deps, cycle detection) |
-| `source_v2/executors/tool_executor.py` | Topological execution, timeout/retry, tool result persistence |
-| `source_v2/executors/input_resolver.py` | `${...}` interpolation against `RuntimeState` |
-| `source_v2/tools/*` | Typed business tools (intent, extract, clarification, research, guideline, generation) |
-| `source_v2/schemas/*` | Plan, runtime state, tool context, tool result, artifact ref contracts |
-
-### 2.3 Core Tool Set (Generation)
-
-- `intent_detect`
-- `input_extract`
-- `clarification_gate`
-- `clarification_tool`
-- `web_research`
-- `guideline_generate`
-- `logo_generate`
-
-Supporting tools:
-- `reference_analyze`
-- `researcher`
-- `tool_search`
-
-### 2.4 Baseline Planner DAG (Default)
-
-```text
-intent -> extract -> clarification_gate -> clarification
-clarification_gate -> research -> guideline -> generate
-```
-
-Resume DAG after clarification answer:
-
-```text
-research -> guideline -> generate
-```
+- Runtime is `source_v2` package: tool-first DAG orchestration with `Runner` + `PlannerTool` + `ToolExecutor`.
+- Tools are OOP classes (`V2BaseTool`) registered in `ToolRegistry`.
+- DAG plans are Pydantic models (`DAGPlan`, `DAGNode`) validated by `DAGValidator` (cycle detection, dependency resolution).
+- Tool inputs support `${...}` placeholder interpolation resolved by `InputResolver` at execution time.
+- Clarification is handled via iterative DAG re-plan with `should_pause_for_clarification()` decision hook.
+- Session state persisted in-memory via `RuntimeState` with `context_version` for stale-write-safe merges.
+- Provider failures are fail-closed with explicit `ToolError` codes.
 
 ---
 
-## 3. Generation Flow (As-Built in source_v2)
+## 2. Scope
 
-### 3.1 Architecture Diagram
+### 2.1 Build vs Defer
+
+| Area | Build (source_v2) | Defer |
+|:---|:---|:---|
+| Intent + input | IntentDetectTool + InputExtractTool + ReferenceAnalyzeTool | Multi-domain intent classifier |
+| Clarification | ClarificationGateTool + ClarificationTool + iterative re-plan | Adaptive personalized questioning policy |
+| Research | WebResearchTool + ResearcherTool (SerpAPI + Gemini analyzer) | Automatic query backfill when image pool is insufficient |
+| Guideline | GuidelineGenerateTool (parallel per-image inference) | Guideline optimization loop |
+| Generation | LogoGenerateTool (parallel option generation) | Provider auto-routing/ranking |
+| **Editing** | **LogoEditTool (Case 1/2/3)** | Multi-candidate ranking before edit output |
+| Planning | PlannerTool (LLM-based DAG planning + deterministic fallback) | Multi-agent self-critique loops |
+| Session/memory | RuntimeState + context_version versioning | Long-term project memory / version history |
+
+### 2.2 Not yet implemented
+
+- Production BFF stream controls (retry/reconnect/backpressure).
+- Queue-decoupled deployment for heavy generation nodes.
+- Confidence-threshold gate policy as hard rule.
+- End-to-end cost analytics by task_id and session_id.
+- Asset retention and signed URL TTL runtime policy.
+- SAM model deployment for Case 1 (FE) and Case 3 (BE mask generation).
+
+---
+
+## 3. System Architecture
+
+### 3.1 Overview
+
+#### 3.1.1 Why this architecture
+
+The source_v2 architecture is a **tool-first DAG runtime** with these key properties:
+
+1. **Tool Registry** — reusable OOP tool classes with metadata-only context for planner prompts.
+2. **DAG Planner** — LLM-based planning with deterministic fallback templates; supports iterative re-plan after clarification.
+3. **Input Interpolation** — `${...}` bindings resolved at execution from `RuntimeState` (node results, query, user_context).
+4. **Executor Middleware** — timeout, retry, and topological-order execution.
+5. **Iterative Clarification** — pause/re-plan loop with `context_version` for stale-write-safe merges.
+6. **Edit Loop** — iterative edit DAG with session state persistence for style tracking.
+
+#### 3.1.2 Diagram — Full flow (flowchart)
+
+> The following diagram shows the complete user journey including the edit loop:
+
+![Full flow diagram](C:\Users\THUC\.gemini\antigravity\brain\1a12dabc-340a-4e42-a7a3-c30d4f2ab75f\image_flowchart_diagram.png)
 
 ```mermaid
 flowchart TD
-  U[User Request] --> A[LogoCreatorAgent.stream]
-  A --> R[Runner.run]
-  R --> P[PlannerTool.plan]
-  P --> V[DAGValidator.validate]
-  V --> E[ToolExecutor.execute_dag]
+  U([User sends message]) --> A1[analyze_logo_request\nmessage, session_id, image?]
+  A1 --> DB1[(write DESIGN.md\nOverview, Brand, Style)]
+  DB1 --> G1{brand + industry?}
 
-  E --> T1[intent_detect]
-  E --> T2[input_extract]
-  E --> T3[clarification_gate]
-  E --> T4[clarification_tool]
-  E --> T5[web_research]
-  E --> T6[guideline_generate]
-  E --> T7[logo_generate]
+  G1 -->|No| CL[Clarify question]
+  CL --> UR([User replies])
+  UR --> A1
 
-  E --> S[(RuntimeState)]
-  S --> I[InputResolver]
-  I --> E
+  G1 -->|Yes| G2{image reference?}
+  G2 -->|No| SR[search_references\nbrand, industry]
+  G2 -->|Yes| AP[auto-pick top 3\nby relevance]
+  SR --> AP
+  AP --> GD[generate_design_guideline\nsession_id]
+  GD --> DB2[(read DESIGN.md\nwrite Do's and Don'ts)]
+  DB2 --> GL[generate_logo\nguideline, count=3]
 
-  R --> C[Stream Chunks]
-  C --> U
+  GL --> EDIT_LOOP
+
+  subgraph EDIT_LOOP["Edit loop"]
+    direction TB
+    SEL([User selects logo]) --> ED[edit_logo\nimage_url, instruction, mask?]
+    ED --> DB3[(update DESIGN.md\nif style changed)]
+    DB3 --> SUG[Suggest follow-ups]
+    SUG --> AGAIN{Edit again?}
+    AGAIN -->|Yes| SEL
+  end
+
+  AGAIN -->|No| DONE([Done])
 ```
 
-### 3.2 Sequence Diagram (Clarification + Resume)
+#### 3.1.3 Diagram — Sequence diagram (full flow)
+
+> The following diagram shows the detailed sequence including the edit loop:
+
+![Sequence diagram](C:\Users\THUC\.gemini\antigravity\brain\1a12dabc-340a-4e42-a7a3-c30d4f2ab75f\image_sequence_diagram.png)
 
 ```mermaid
 sequenceDiagram
-  actor User
-  participant Agent as LogoCreatorAgent
-  participant Runner
-  participant Planner as PlannerTool
-  participant Executor as ToolExecutor
-  participant State as RuntimeState
+  actor FE as Frontend
+  participant AG as Agent (Runner)
+  participant TL as Tools
+  participant DB as DB (DESIGN.md)
+  participant IMG as Image API
 
-  User->>Agent: stream(query, user_context)
-  Agent->>Runner: run(query, user_context, task_id?)
-  Runner->>Planner: plan(query, user_context, tool_contexts, runtime_state)
-  Planner-->>Runner: DAG JSON
-  Runner->>Executor: execute_dag(plan, runtime_state)
+  Note over FE: generate session_id
 
-  Executor->>State: save intent/extract/gate result
-  alt required fields missing
-    Executor->>State: save clarification questions
-    Runner-->>User: clarification_needed + runtime_state + resume_after_clarification
-    User->>Agent: stream(query, user_context + clarification_answer)
-    Runner->>Planner: plan(post-clarification)
-    Planner-->>Runner: research -> guideline -> generate
-    Runner->>Executor: execute_dag(resume segment)
-  else gate passed
-    Executor->>State: save research/guideline/generate result
-  end
-
-  Runner-->>User: generation_option_ready (repeat)
-  Runner-->>User: completed
-```
-
-### 3.3 Stream Milestones
-
-Primary emitted `metadata.stage` values:
-- `planning_ready`
-- `intent_ready`
-- `context_extracted`
-- `clarification_gate_checked`
-- `clarification_questions_ready`
-- `clarification_needed`
-- `research_completed`
-- `guideline_completed`
-- `generation_option_ready`
-- `generation_completed`
-- `completed`
-
-Failure outputs include `error_code` and `error_message`.
-
----
-
-## 4. Full Flow with Image Editing Loop
-
-This section integrates generation + editing based on the provided flow and sequence diagrams.
-
-### 4.1 End-to-End Full Flow Diagram
-
-```mermaid
-flowchart TD
-  U1([User sends message]) --> A1[analyze_logo_request(message, session_id, image?)]
-  A1 --> D1[(write DESIGN.md<br/>Overview, Brand, Style)]
-  D1 --> G1{brand + industry?}
-
-  G1 -- No --> Q1[Clarify question]
-  Q1 --> U2([User replies])
-  U2 --> A1
-
-  G1 -- Yes --> G2{image reference?}
-  G2 -- No --> R1[search_references(brand, industry)]
-  R1 --> R2[auto-pick top 3 by relevance]
-  R2 --> GG[generate_design_guideline(session_id)]
-  G2 -- Yes --> GG
-
-  GG --> D2[(read DESIGN.md<br/>write Do's and Don'ts)]
-  D2 --> LG[generate_logo(guideline, count=3)]
-
-  subgraph EDIT[Edit loop]
-    U3([User selects logo]) --> E1[edit_logo(image_url, instruction, mask?)]
-    E1 --> D3[(update DESIGN.md if style changed)]
-    D3 --> S1[Suggest follow-ups]
-    S1 --> G3{Edit again?}
-    G3 -- Yes --> U3
-  end
-
-  LG --> U3
-  G3 -- No --> DONE([Done])
-```
-
-### 4.2 Full Flow Sequence Diagram
-
-```mermaid
-sequenceDiagram
-  actor User
-  participant Agent
-  participant Tools
-  participant DesignDB as DESIGN.md session store
-  participant ImgAPI as Image API
-
-  User->>Agent: generate(session_id, message, image?)
-  Agent->>Tools: analyze_logo_request(...)
-  Tools->>DesignDB: write session (overview, brand, style)
-  DesignDB-->>Tools: ok
+  FE->>AG: POST /stream (task_type="logo_design", session_id, message, image?)
+  AG-->>FE: {type:"progress", stage:"analyzing"}
+  AG->>TL: analyze_logo_request(message, image?, session_id)
+  TL->>DB: write(session_id, Overview, Brand, Style)
+  DB-->>TL: ok
+  TL-->>AG: {brand, industry, is_sufficient}
 
   alt missing brand or industry
-    Agent-->>User: stream clarify question
-    User->>Agent: user reply
-    Agent->>Tools: analyze_logo_request(reply, session_id)
-    Tools->>DesignDB: update session
-    DesignDB-->>Tools: ok
+    AG-->>FE: stream clarify question
+    FE->>AG: POST /stream (task_type="logo_design", session_id, user reply)
+    AG-->>FE: {type:"progress", stage:"analyzing"}
+    AG->>TL: analyze_logo_request(reply, session_id)
+    TL->>DB: update(session_id, Brand, Style)
+    DB-->>TL: ok
+    TL-->>AG: {brand, industry, is_sufficient}
   end
 
-  Agent->>Tools: search_references(brand, industry)
-  Tools-->>Agent: references (top 3)
-  Agent->>Tools: generate_design_guideline(session_id)
-  Tools->>DesignDB: read session + write do/dont
-  Tools-->>Agent: prompt, negative_prompt, palette, style tags
+  AG-->>FE: {type:"progress", stage:"searching_references"}
+  AG->>TL: search_references(brand, industry)
+  TL-->>AG: references[3]
 
-  Agent->>ImgAPI: generate_logo(guideline, count=3)
-  ImgAPI-->>Agent: image_urls[3]
-  Agent-->>User: stream result options
+  AG-->>FE: {type:"references", data:references[3]}
+  AG-->>FE: {type:"progress", stage:"creating_guideline"}
 
-  loop edit loop
-    User->>Agent: edit(image_url, instruction, mask?)
-    Agent->>ImgAPI: edit_logo(...)
-    ImgAPI-->>Agent: edited_image_url
-    Agent->>DesignDB: update style if changed
-    Agent-->>User: edited result + follow-up suggestions
+  AG->>TL: generate_design_guideline(session_id)
+  TL->>DB: read(session_id)
+  DB-->>TL: Overview + Brand + Style
+  TL->>DB: write(session_id, Do's and Don'ts)
+  DB-->>TL: ok
+  TL-->>AG: {prompt, negative_prompt, style_tags, palette}
+
+  AG-->>FE: {type:"guideline", data:{prompt, style_tags, palette}}
+  AG-->>FE: {type:"progress", stage:"generating_logos"}
+
+  AG->>TL: generate_logo(guideline, count=3)
+  TL->>IMG: generate(prompt)
+  IMG-->>TL: image_urls[3]
+  TL-->>AG: image_urls[3]
+
+  AG-->>FE: {type:"result", data:image_urls[3]}
+
+  loop User edits
+    FE->>AG: POST /stream (task_type="logo_design", session_id, edit instruction, selected_url)
+    AG-->>FE: {type:"progress", stage:"editing_logo"}
+    AG->>TL: edit_logo(image_url, instruction, session_id, mask?)
+    TL->>DB: update(session_id, Style)
+    DB-->>TL: ok
+    TL->>IMG: edit(image_url, instruction, mask?)
+    IMG-->>TL: image_url
+    TL-->>AG: image_url
+    AG-->>FE: {type:"result", data:image_url}
+    AG-->>FE: {type:"suggestions", data:suggestions[]}
   end
 ```
 
-### 4.3 Editing Cases
+#### 3.1.4 Diagram — DAG pipeline (source_v2 internals)
 
-| Case | Frontend Input | Backend Handling | Best Fit |
-| :--- | :--- | :--- | :--- |
-| Case 1: FE mask + BE inpainting | Original image + binary mask + prompt | Strict inpainting on masked region | Precise local edits, typography-safe updates |
-| Case 2: Minimal edit (no mask) | Original image + prompt | Semantic image edit without explicit mask | Fast UX iteration and low UI complexity |
-| Case 3: Crop-guided edit | Original image + crop + prompt | BE generates mask via SAM, then inpainting | Balance between simple FE and precise region control |
+```mermaid
+flowchart TD
+  U[User Request] --> API[POST /stream]
+  API --> AGENT[LogoCreatorAgent]
+  AGENT --> RUNNER[Runner]
+  RUNNER --> PLANNER[PlannerTool]
+
+  subgraph DAG_GEN["DAG Plan — Generate Flow"]
+    direction TB
+    N1[intent\n IntentDetectTool]
+    N2[extract\n InputExtractTool]
+    N3[clarification_gate\n ClarificationGateTool]
+    N4[clarification\n ClarificationTool]
+    N5[research\n WebResearchTool]
+    N6[guideline\n GuidelineGenerateTool]
+    N7[generate\n LogoGenerateTool]
+  end
+
+  subgraph DAG_EDIT["DAG Plan — Edit Flow"]
+    direction TB
+    E1[edit\n LogoEditTool]
+  end
+
+  PLANNER --> N1
+  N1 --> N2
+  N2 --> N3
+  N3 -->|missing fields| N4
+  N4 --> RUNNER
+  N3 -->|gate passed| N5
+  N5 --> N6
+  N6 --> N7
+
+  N7 --> |User selects + edit| E1
+
+  subgraph EXEC["Executor Layer"]
+    direction TB
+    TE[ToolExecutor]
+    IR[InputResolver]
+    DV[DAGValidator]
+  end
+
+  RUNNER --> TE
+  TE --> IR
+  TE --> DV
+
+  subgraph INFRA["Infrastructure"]
+    direction TB
+    REG[ToolRegistry]
+    RS[RuntimeState]
+    CFG[SourceV2Settings]
+  end
+
+  AGENT --> REG
+  RUNNER --> RS
+  RUNNER --> CFG
+
+  subgraph EXTERNAL["External Services"]
+    direction TB
+    LLM[Gemini Text/Multimodal LLM]
+    WEB[SerpAPI]
+    IMGAPI[Image Generation API]
+    EDITAPI[Image Edit API]
+  end
+
+  N1 --> LLM
+  N2 --> LLM
+  N5 --> WEB
+  N5 --> LLM
+  N6 --> LLM
+  N7 --> IMGAPI
+  E1 --> EDITAPI
+```
+
+### 3.2 Architecture principles
+
+- **Tool-first**: business logic is encapsulated in registerable tool classes with explicit input/output schemas.
+- **Schema-first**: Pydantic models enforce DAG plan, tool IO, and runtime state contracts.
+- **DAG-first planning**: LLM-based planner generates DAG JSON; deterministic templates as fallback.
+- **Interpolation-driven**: `${...}` bindings decouple tool wiring from execution.
+- **Iterative re-plan**: clarification pauses DAG, persists state, and resumes with post-clarification plan.
+- **Fail-closed**: tool execution failures propagate explicit `ToolError` codes.
+- **Context-versioned**: `RuntimeState.context_version` prevents stale-write conflicts.
+
+#### 3.2.1 Memory flow contract (source_v2)
+
+1. `Runner` owns the execution loop state — `RuntimeState` including `node_results`, `artifacts`, `context_version`.
+2. `PlannerTool` receives `runtime_state` and `tool_contexts` to generate DAG plans.
+3. `ToolExecutor` runs nodes in topological order, resolving `${...}` inputs from `RuntimeState`.
+4. `RuntimeState` is persisted per `session_id` in `Runner._runtime_sessions` (in-memory).
+5. Clarification follow-up restores state from persisted session or `user_context.runtime_state`.
+6. `context_version` increments on each persist to detect version conflicts.
+
+#### 3.2.2 Simplification notes
+
+- Planner and executor are separate modules but run in one stream lifecycle.
+- DAG execution is sequential (topological order), not parallelized across independent nodes.
+- Session store is in-memory (`dict`) — does not survive process restarts.
+- Edit flow reuses the same `Runner` and `ToolRegistry` infrastructure.
+
+### 3.3 Component breakdown
+
+#### 3.3.1 Agent layer
+
+| Component | Role | Notes |
+|:---|:---|:---|
+| LogoCreatorAgent | High-level facade; wires registry, planner, executor, and runner | Entry point for external callers |
+| Runner (BaseRunner) | Iterative DAG execution loop with clarification pause and re-plan | Owns `RuntimeState`, session persistence, chunk emission |
+
+#### 3.3.2 Planner layer
+
+| Component | Role | Notes |
+|:---|:---|:---|
+| PlannerTool (BasePlanner) | LLM-based DAG planner with deterministic fallback templates | Supports `async_genai` and `openai` frameworks; auto-repair on malformed output |
+| planner_templates | `build_default_logo_plan()` and `build_post_clarification_plan()` | Deterministic fallback DAGs |
+| DAGValidator | Topological sort + cycle detection + dependency validation | Throws `DAGValidationError` |
+
+#### 3.3.3 Executor layer
+
+| Component | Role | Notes |
+|:---|:---|:---|
+| ToolExecutor (BaseToolExecutor) | Execute DAG nodes with timeout and retry middleware | Skips clarification node when gate passes |
+| InputResolver | Resolve `${...}` placeholders against `RuntimeState` | Supports nested paths like `${extract.result.context.brand_name}` |
+| ExecutionValidator | Decision hook: `should_pause_for_clarification()` | Checks clarification_gate result |
+
+#### 3.3.4 Tool layer — Generate flow
+
+| Tool | DAG node id | Purpose | Delegates to |
+|:---|:---|:---|:---|
+| IntentDetectTool | `intent` | Detect logo generation intent | `LogoDesignToolset.detect_intent_async()` |
+| InputExtractTool | `extract` | Extract brand context from query + references | `LogoDesignToolset.extract_inputs_async()` |
+| ReferenceAnalyzeTool | — | Analyze reference images for visual preferences | `LogoDesignToolset.analyze_reference_images_async()` |
+| ClarificationGateTool | `clarification_gate` | Check `brand_name` + `industry` presence | `RequiredFieldState.from_context()` |
+| ClarificationTool | `clarification` | Generate clarification questions for missing fields | `LogoDesignToolset.suggest_clarifications_async()` |
+| WebResearchTool | `research` | Collect web references and multimodal analyses | `WebResearchService.run_async()` |
+| ResearcherTool | — | High-level wrapper for web research results | Wraps `WebResearchTool` |
+| GuidelineGenerateTool | `guideline` | Generate per-concept design guidelines | `LogoDesignToolset.infer_guideline_for_image_async()` (parallel) |
+| LogoGenerateTool | `generate` | Generate logo options from guidelines | `OptionGenerationService.iter_generate_async()` |
+| ToolSearchTool | — | Search available tools by name/description | Local keyword search on `ToolContext` |
+
+#### 3.3.5 Tool layer — Edit flow
+
+| Tool | DAG node id | Purpose | Delegates to |
+|:---|:---|:---|:---|
+| LogoEditTool | `edit` | Edit a generated logo (Case 1/2/3) | Image Edit API (Gemini, gpt-image, Flux) |
+
+#### 3.3.6 Schema layer
+
+| Schema | Purpose |
+|:---|:---|
+| DAGPlan | Plan containing `planning_mode`, `nodes[]`, `edges[]` |
+| DAGNode | Single node: `id`, `tool`, `tool_input`, `deps[]` |
+| PlanningMode | Enum: `single_pass` or `iterative` |
+| RuntimeState | Mutable execution state: `input`, `node_results`, `artifacts`, `clarification_round`, `context_version` |
+| ToolContext | Metadata-only tool contract for planner prompts |
+| ToolResult | Node execution result with `result`, `error`, `trace` |
+| ToolError | Structured error with `code` and `message` |
+| LargePayloadRef | Stable artifact reference for oversized payloads |
+| ArtifactKind | Enum: `inline`, `file`, `object_store`, `vector_store` |
+
+### 3.4 End-to-end pipeline
+
+#### 3.4.1 Generate flow — Default DAG
+
+```
+intent → extract → clarification_gate → [clarification] → research → guideline → generate
+```
+
+Planner template: `build_default_logo_plan()`
+
+| Node | Tool | Input bindings | Dependencies |
+|:---|:---|:---|:---|
+| `intent` | `intent_detect` | `query: ${query}` | — |
+| `extract` | `input_extract` | `query: ${query}`, `references: ${user_context.references}` | `intent` |
+| `clarification_gate` | `clarification_gate` | `context: ${extract.result.context}` | `extract` |
+| `clarification` | `clarification_tool` | `missing_fields: ${clarification_gate.result.missing_fields}`, `query: ${query}`, `current_context: ${extract.result.context}` | `clarification_gate` |
+| `research` | `web_research` | `brand_context: ${extract.result.context}` | `clarification_gate` |
+| `guideline` | `guideline_generate` | `brand_context: ${extract.result.context}`, `research_context: ${research.result.research_context}` | `research` |
+| `generate` | `logo_generate` | `task_id: ${task_id}`, `guidelines: ${guideline.result.guidelines}`, `brand_name: ${extract.result.context.brand_name}`, `industry: ${extract.result.context.industry}`, `variation_count: ${user_context.variation_count}` | `guideline` |
+
+#### 3.4.2 Post-clarification DAG
+
+When `clarification_answer` is provided and `extract` result exists:
+
+```
+research → guideline → generate
+```
+
+Planner template: `build_post_clarification_plan()`
+
+The Runner applies `clarification_answer` fields (brand_name, industry, style_preference, color_preference, symbol_preference, typography_direction) into the existing `extract.result.context` before re-planning.
+
+#### 3.4.3 Edit flow — Edit DAG
+
+After generation completes, user can enter the edit loop:
+
+```
+edit (→ update_design_md → suggest_follow_ups)
+```
+
+Frontend sends: `POST /stream` with `task_type="logo_design"`, `session_id`, `edit_instruction`, `selected_url`, optional `mask` or `crop`.
+
+| Item | Detail |
+|:---|:---|
+| Input | `image_url` (selected logo), `instruction` (edit prompt), optional `mask` or `crop_image` |
+| Tool used | `LogoEditTool` → Image Edit API |
+| Editing case | Auto-detected based on input presence (mask → Case 1, crop → Case 3, neither → Case 2) |
+| DESIGN.md update | If style changed, update session's DESIGN.md |
+| Output | Edited `image_url` + trace metadata + `suggestions[]` |
+| Loop | User can continue editing or finish |
+
+#### 3.4.4 Clarification loop mechanics
+
+1. `ToolExecutor` executes `clarification_gate` node.
+2. If `gate.result.passed == false`, executor continues to `clarification` node (generates questions).
+3. `ExecutionValidator.should_pause_for_clarification()` returns `true`.
+4. `Runner` emits `clarification_needed` chunk with `missing_fields`, `questions`, and full `runtime_state`.
+5. `Runner` persists `RuntimeState` to session store with version check.
+6. On next call, `Runner` restores state, applies `clarification_answer`, and `PlannerTool` returns `build_post_clarification_plan()`.
+7. Max rounds configured via `max_clarification_rounds` (default: 2).
+
+#### 3.4.5 Stream status progression
+
+Generate flow:
+```
+planning_ready → intent_ready → context_extracted → clarification_gate_checked →
+  [clarification_questions_ready → clarification_needed] →
+  research_completed → guideline_completed →
+  generation_option_ready (repeated) → generation_completed → completed
+```
+
+Edit flow:
+```
+planning_ready → editing_logo → edit_completed → completed
+```
 
 ---
 
-## 5. Schemas and API Contracts
+## 4. Image Editing Phase
 
-### 5.1 Generation Contracts (source_v2)
+### 4.1 Phase objective
 
-- Planner contract: `DAGPlan(planning_mode, nodes, edges)`.
-- Runtime contract: `RuntimeState(input, node_results, artifacts, clarification_round, context_version)`.
-- Tool result contract: `ToolResult(node_id, tool_name, result, error, trace)`.
-- Large payload contract: `LargePayloadRef(ref_id, kind, preview, uri_or_key)`.
+- Enable controlled edits on generated logos.
+- Prioritize region accuracy, output consistency, and response speed.
+- Capture measurable metrics for latency, cost, quality, and user satisfaction.
 
-Execution-time binding:
-- `InputResolver` resolves `${query}`, `${user_context.*}`, `${node_id.result.*}`.
-- Defaults for missing user context:
-  - `references = []`
-  - `variation_count = 1`
+### 4.2 Three editing cases
 
-Logo generation tool constraints:
-- `variation_count` range: 1..4
+| Case | Purpose | Frontend Input | Backend Handling | Output | Key Risks |
+|:---|:---|:---|:---|:---|:---|
+| Case 1: FE Mask + BE Inpainting | Precise local edit with clear protected area | Source image + Binary mask (white=edit, black=keep) + Prompt | Inpainting model edits white region, preserves black region, blends edges | Edited image + trace metadata | Wrong mask quality, boundary artifacts |
+| Case 2: Minimal Edit (No Mask) | Fast editing with lowest UI complexity | Source image + Prompt only | Edit/generation model receives image+prompt; no hard mask constraint | Edited image + trace metadata | Over-editing outside target area |
+| Case 3: Crop-guided Edit | Keep FE simple while still using mask constraints | Source image + Bounding-box crop image + Prompt | BE runs SAM/segmenter on source+crop to create mask, then inpainting | Edited image + generated mask + trace metadata | Crop too loose/tight, mask derivation errors |
 
-### 5.2 Proposed Edit API Contracts
+### 4.3 Case details
+
+#### 4.3.1 Case 1 — FE Mask + BE Inpainting
+
+**Step 1: Frontend (Data Initialization)**
+1. User clicks a detail on the generated logo.
+2. FE runs SAM in browser and creates `Mask_Image` (white = edit region, black = keep region).
+3. FE setup: `npm install onnxruntime-web`, load SAM ONNX weights (lazy-load on first click), inference via WebAssembly/WebGPU.
+4. User enters edit instruction (e.g., "Turn this shape into a fire dragon").
+5. FE calls `POST /edit` with: `Original_Image`, `Mask_Image`, `Raw_Prompt`.
+
+**Step 2: Backend (Inpainting Execution)**
+1. BE calls an image edit/inpainting API with `image`, `mask`, `prompt`.
+2. Model behavior: keep 100% of black-mask pixels, regenerate white-mask region, auto-blend boundaries.
+
+#### 4.3.2 Case 2 — Minimal Edit (1 image + 1 prompt)
+
+**Step 1: Frontend**
+1. FE sends only `Original_Image` and `Raw_Prompt`.
+
+**Step 2: Backend**
+1. BE calls image edit/generation model with image+prompt.
+2. Model understands prompt semantically; internal attention acts as implicit mask.
+3. BE injects preservation instruction (keep layout/style where possible).
+4. Return edited image and trace metadata.
+
+#### 4.3.3 Case 3 — Source + Crop + Prompt (Mask generated in BE)
+
+**Step 1: Frontend**
+1. FE sends: `Original_Image`, `Crop_Image` (bounding-box crop of target region), `Raw_Prompt`.
+
+**Step 2: Backend**
+1. Locate crop region against original image.
+2. Run SAM (or another segmenter) in backend to convert crop into binary mask.
+3. Run inpainting with `Original_Image` + generated mask + `Raw_Prompt`.
+4. Return edited image, optional debug mask, and trace metadata.
+
+### 4.4 Edit tool integration in source_v2
 
 ```python
-class LogoEditInput(BaseModel):
-    session_id: str
+class LogoEditInput(ToolInput):
     image_url: str
     instruction: str
-    case_mode: Literal["mask", "no_mask", "crop"]
-    mask_image: str | None = None
-    crop_image: str | None = None
-    preserve_layout: bool = True
+    session_id: str
+    mask_image: str | None = None        # Case 1: base64 or URL
+    crop_image: str | None = None        # Case 3: base64 or URL
+    editing_case: str | None = None      # "case_1", "case_2", "case_3" or auto-detect
 
-class LogoEditOutput(BaseModel):
+class LogoEditOutput(ToolOutput):
     edited_image_url: str
-    model_name: str
-    case_mode: str
-    style_updated: bool
-    follow_ups: list[str] = []
-    trace: dict[str, Any] = {}
+    editing_case: str
+    mask_used: bool
+    trace: dict
 ```
 
-Validation rules:
-- `instruction` must be non-empty.
-- `case_mode=mask` requires `mask_image`.
-- `case_mode=crop` requires `crop_image`.
-- `case_mode=no_mask` accepts only image + prompt.
+Auto-detection logic:
+- `mask_image` present → Case 1
+- `crop_image` present → Case 3
+- Neither → Case 2
 
 ---
 
-## 6. Models Benchmark
+## 5. Image Models Benchmark
 
-### 6.1 Text and Planning Models (Step 1-4)
+### 5.1 Generation models (logo generation — Stage C)
 
-| Model | Role | Quality | Latency | Cost | Recommendation |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `gemini-2.5-flash` | Planner, intent, extract, clarification, guideline prompting | High for structured output with guardrails | Low-Medium | Low-Medium | Default in `.env` for source_v2 |
-| `gpt-4o-mini` | Alternative planner/extractor | Medium-High | Low-Medium | Medium | Optional fallback provider |
-| `gpt-4o` | Complex reasoning and repair-heavy planning | High | Medium | High | Use when strict quality > cost |
+| Model | Used in | Notes |
+|:---|:---|:---|
+| Gemini Image Generation | `LogoGenerateTool` → `OptionGenerationService` | Current default for logo option generation |
 
-### 6.2 Image Generation Models (Step 6)
+### 5.2 Editing models
 
-| Name | Average Cost | Average Latency | Best Use Case | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| `gemini-2.5-flash-image` | ~$0.039/image (1024px) | ~6s | Default fast generation | Current env default image model |
-| `gemini-3.1-flash-image-preview` | ~$0.067/image (1024px) | 23-56s | Higher quality campaign assets | Preview-tier latency variance |
-| `gemini-3-pro-image-preview` | ~$0.05/image | 3-12s | Premium brand output | Higher quality tier |
-| `openai/gpt-image-1.5` | ~$0.034/image (medium) | 15-45s | Strong prompt fidelity | Good alt provider |
+| Name | Pricing | Avg Cost | Avg Latency | Latency vs Output Token | Recommended Use Case | Case Fit | Note |
+|:---|:---|:---|:---|:---|:---|:---|:---|
+| google/gemini-2.5-flash-image (Nano Banana) | $30/1M output tokens; ~1,290 tokens/1024px (~$0.039/image) | $0.039 (1024px) | ~6s | Positive — latency grows with output token count | Low-cost bulk generation, rapid prototyping, high-throughput creation | Case 2 | Free tier exists with rate limits |
+| google/gemini-3.1-flash-image-preview (Nano Banana 2) | ~$0.045–$0.151/image; 1024px ~$0.067 | $0.067 (1024px) | 23–56s (avg ~37.6s) | Weak/unclear correlation | High-quality premium generation, larger-resolution marketing assets | Case 2 | Preview-phase variability |
+| google/gemini-3-pro-image-preview (Nano Banana Pro) | ~$0.02–$0.08/image | ~$0.05 | 3–12s | Increases with resolution | Professional-grade, stronger text rendering, high-res brand graphics | Case 2 | Supports up to 4K-class outputs |
+| openai/gpt-image-1 | Low $0.011, Medium $0.042, High $0.167 | $0.042 (medium) | ~45–50s | Higher quality tiers increase latency | General-purpose generation/editing | Case 2 | Token-based billing in some modes |
+| openai/gpt-image-1.5 | Low $0.009–$0.052, Medium $0.034–$0.051, High $0.133–$0.200 | $0.034 (medium) | 15–45s | Increases with quality tier | Premium marketing edits, stronger prompt adherence | Case 2 | Faster than gpt-image-1 |
+| black-forest-labs/flux-fill-pro | Fixed ~$0.05/exec | $0.05 | ~9s | Minimal — fixed-size inpainting | Inpainting, local replacement, content-aware fill | **Case 1, Case 3** | Good for production edit pipelines |
+| black-forest-labs/flux-kontext-pro | ~$0.04/image | $0.04 | ~7s | Low sensitivity | Fast iterative editing with strong content preservation | Case 2, Case 3 | Good trade-off for interactive tools |
+| black-forest-labs/flux-kontext-max | ~$0.08/image (premium) | $0.08 | N/A | N/A | Highest-fidelity editing, final-asset polishing | Case 2, Case 3 | Premium tier for quality |
+| black-forest-labs/flux-kontext-dev | ~$0.025/image | $0.025 | N/A | N/A | Development, experimentation, low-cost testing | Case 2 (R&D), Case 3 (R&D) | Often non-commercial license |
+| prunaai/flux-kontext-fast | ~$0.005/image | $0.005 | Sub-second to few seconds | Scales with resolution/steps | Real-time creative apps, low-latency web experiences | Case 2 | Very cost-effective for prototyping |
+| black-forest-labs/flux-2-flex | ~$0.06/image | $0.06 | ~13s | Scales with diffusion steps | Balanced quality/speed for production | Case 2, Case 3 | Tunable quality-speed trade-off |
+| black-forest-labs/flux-2-dev | ~$0.025/image | $0.025 | N/A | N/A | Open-weight experimentation | Case 2 (R&D), Case 3 (R&D) | Self-host option possible |
 
-### 6.3 Image Editing Models (Step 7)
+### 5.3 Model selection strategy
 
-| Name | Case Fit | Avg Cost | Avg Latency | Best Use Case |
-| :--- | :--- | :--- | :--- | :--- |
-| `black-forest-labs/flux-fill-pro` | Case 1, Case 3 | ~$0.05 | ~9s | Strict inpainting by mask |
-| `black-forest-labs/flux-kontext-pro` | Case 2, Case 3 | ~$0.04 | ~7s | Fast interactive editing |
-| `black-forest-labs/flux-kontext-max` | Case 2, Case 3 | ~$0.08 | N/A | Highest-fidelity polishing |
-| `prunaai/flux-kontext-fast` | Case 2 | ~$0.005 | sub-second to few seconds | Real-time UX prototype |
-| `openai/gpt-image-1.5` | Case 2 | tiered | 15-45s | Strong no-mask prompt edits |
-| `gemini-2.5-flash-image` | Case 2 | ~$0.039 | ~6s | Cost-efficient no-mask edits |
+| Editing Case | Primary Model | Fallback Model | Rationale |
+|:---|:---|:---|:---|
+| Case 1 (FE Mask) | flux-fill-pro | flux-kontext-pro | flux-fill-pro is purpose-built for mask-based inpainting |
+| Case 2 (Minimal) | gemini-2.5-flash-image | gpt-image-1.5 | Best cost/latency ratio for prompt-only editing |
+| Case 3 (Crop-guided) | flux-kontext-pro | flux-fill-pro | Strong content preservation with backend mask generation |
 
-### 6.4 Benchmark Protocol
+### 5.4 Benchmark template
 
-- Use one fixed dataset across all models.
-- Track per run: prompt, resolution, latency, cost, success/failure, user score.
-- For Case 1 and Case 3, include region preservation score and edge artifact score.
-- For Case 2, include drift score (non-target region changes).
-- Report p50/p95 latency and cost per accepted output.
+#### Dataset
+
+| ID | Image Model Benchmark Result |
+|:---|:---|
+| 1 |  |
+
+**Testcase:**
+
+**Testcase explanation**
+
+**Input**
+
+| Input |  |
+|:---|:---|
+| Model |  |
+| Output |  |
+
+**Result**
+
+| Result |  |
+|:---|:---|
+|  |  |
+
+| ID | Image Model Benchmark Result |
+|:---|:---|
+| 2 |  |
+
+**Testcase:**
+
+**Testcase explanation**
+
+**Input**
+
+| Text Input |  |
+|:---|:---|
+| Image Input |  |
+| Model |  |
+| Output |  |
+
+**Result**
+
+| Result |  |
+|:---|:---|
+|  |  |
+
+#### Benchmark notes
+- Use the same source image set across all models.
+- Record prompt, resolution, latency, and user feedback for each run.
+- For Case 1, validate black-region preservation and white-region edit fidelity.
+- For Case 3, store crop alignment diagnostics and backend-generated mask path.
+- For Case 2, track layout drift and over-edit frequency due to implicit masking behavior.
+- When a model is listed as Case 2 only, avoid using it for strict masked inpainting.
 
 ---
 
-## 7. Risks and Mitigations
+## 6. Data Schema and API Integration
 
-### 7.1 Generation Risks
+### 6.1 Pydantic models (source_v2 schemas)
 
-- Invalid but syntactically valid planner DAG.
-  - Mitigation: semantic guardrails + deterministic template fallback.
-- Clarification loop never converges.
-  - Mitigation: `max_clarification_rounds` cutoff and fail-fast error.
-- Large payload memory pressure.
-  - Mitigation: artifact reference (`options_ref`) fallback.
+```python
+# --- DAG ---
+class PlanningMode(str, Enum):
+    single_pass = "single_pass"
+    iterative = "iterative"
 
-### 7.2 Edit Risks
+class DAGNode(BaseModel):
+    id: str                           # Unique node identifier
+    tool: str                         # Registered tool name
+    tool_input: dict[str, Any] = {}   # ${...} interpolation bindings
+    deps: list[str] = []              # Dependency node ids
 
-- Incorrect mask boundary leads to artifacts.
-  - Mitigation: mask QA checks + feathering.
-- No-mask edit drifts entire logo.
-  - Mitigation: enforce preservation instruction and optional auto-switch to Case 1 or 3.
-- Crop-guided mask mismatch.
-  - Mitigation: crop alignment diagnostics + debug-mask return.
+class DAGPlan(BaseModel):
+    planning_mode: PlanningMode = PlanningMode.iterative
+    nodes: list[DAGNode] = []
+    edges: list[tuple[str, str]] = []  # Auto-derived from deps
+
+# --- Runtime ---
+class RuntimeState(BaseModel):
+    input: dict[str, Any] = {}
+    node_results: dict[str, ToolResult] = {}
+    artifacts: dict[str, LargePayloadRef] = {}
+    clarification_round: int = 0
+    context_version: int = 0
+
+# --- Tool IO ---
+class ToolResult(BaseModel):
+    node_id: str
+    tool_name: str
+    result: Any = None
+    error: ToolError | None = None
+    trace: dict[str, Any] = {}
+    produced_at: float
+
+class ToolError(BaseModel):
+    code: str
+    message: str
+
+class LargePayloadRef(BaseModel):
+    ref_id: str
+    kind: ArtifactKind     # inline, file, object_store, vector_store
+    preview: str | None
+    uri_or_key: str
+
+# --- Tool Context (for planner prompts) ---
+class ToolContext(BaseModel):
+    name: str
+    description: str
+    parameters: dict[str, Any] = {}
+    output: dict[str, Any] = {}
+```
+
+### 6.2 Tool input/output schemas
+
+```python
+# IntentDetectTool
+class IntentDetectInput(ToolInput):
+    query: str
+
+class IntentDetectOutput(ToolOutput):
+    is_logo_intent: bool
+    confidence: float
+    reason: str
+
+# InputExtractTool
+class InputExtractInput(ToolInput):
+    query: str
+    references: list[dict] = []
+
+class InputExtractOutput(ToolOutput):
+    context: dict     # BrandContext fields
+    confidence: float
+    reason: str
+
+# ClarificationGateTool
+class ClarificationGateInput(ToolInput):
+    context: dict = {}
+
+class ClarificationGateOutput(ToolOutput):
+    passed: bool
+    missing_fields: list[str] = []
+
+# ClarificationTool
+class ClarificationInput(ToolInput):
+    missing_fields: list[str] = []
+    query: str
+    current_context: dict = {}
+
+class ClarificationOutput(ToolOutput):
+    questions: list[dict] = []
+
+# WebResearchTool
+class WebResearchInput(ToolInput):
+    brand_context: dict = {}
+    requested_optional_fields: list[str] = []
+
+class WebResearchOutput(ToolOutput):
+    research_context: dict
+
+# GuidelineGenerateTool
+class GuidelineGenerateInput(ToolInput):
+    brand_context: dict = {}
+    research_context: dict = {}
+
+class GuidelineGenerateOutput(ToolOutput):
+    guidelines: list[dict] = []
+
+# LogoGenerateTool
+class LogoGenerateInput(ToolInput):
+    task_id: str
+    guidelines: list[dict] = []
+    brand_name: str | None = None
+    industry: str | None = None
+    variation_count: int = 1    # [1, 4]
+
+class LogoGenerateOutput(ToolOutput):
+    options: list[dict] = []
+
+# LogoEditTool (new)
+class LogoEditInput(ToolInput):
+    image_url: str
+    instruction: str
+    session_id: str
+    mask_image: str | None = None
+    crop_image: str | None = None
+    editing_case: str | None = None
+
+class LogoEditOutput(ToolOutput):
+    edited_image_url: str
+    editing_case: str
+    mask_used: bool
+    trace: dict
+```
+
+### 6.3 Validation rules and merge precedence
+
+- `query` must be non-empty after trim.
+- Required-field gate requires both `brand_name` and `industry`.
+- Clarification answer merge precedence: `answer fields > existing extract.result.context`.
+- Supported clarification fields: `brand_name`, `industry`, `style_preference`, `color_preference`, `symbol_preference`, `typography_direction`.
+- Empty string for optional scalar fields is normalized to `None`.
+- `variation_count` defaults to 1 (configurable via `user_context`).
+- Edit case auto-detection: mask → Case 1, crop → Case 3, neither → Case 2.
+
+### 6.4 Endpoint mapping
+
+```
+POST /stream (task_type="logo_design")
+  → Generate flow: intent → extract → gate → [clarification] → research → guideline → generate
+  → Edit flow: edit (with selected_url + instruction + optional mask/crop)
+```
+
+Stream status progression — see Section 3.4.5.
+
+### 6.5 Configuration
+
+```python
+class SourceV2Settings(BaseSettings):
+    planner_framework: str = "async_genai"           # or "openai"
+    planner_model: str = "gemini-2.5-flash"
+    planner_api_key: str | None = None
+    planner_temperature: float = 0.0
+    planner_repair_attempts: int = 1
+    planner_use_llm: bool = True
+
+    google_api_key: str | None = None
+    gemini_text_model: str = "gemini-2.5-flash"
+
+    max_clarification_rounds: int = 2
+    tool_timeout_seconds: float = 90.0
+    retry_attempts: int = 1
+
+    inline_payload_limit_chars: int = 4000
+```
 
 ---
 
-## 8. Rollout Plan
+## 7. Risks and open issues
 
-1. Phase 1 (done): source_v2 generation flow with clarification and streaming.
-2. Phase 2: integrate `logo_edit` endpoint with Case 2 (no-mask) baseline.
-3. Phase 3: add Case 1 and Case 3 mask workflows.
-4. Phase 4: style-memory update (`DESIGN.md`) and follow-up suggestion loop.
-5. Phase 5: benchmarking automation and model auto-routing policy.
+### 7.1 Latency
+
+**Risk:** Web research + multimodal analysis can increase p95 latency for generate flow.
+
+**Mitigation:**
+- Bounded query policy and fetchable-image filtering.
+- Parallel guideline inference (`asyncio.gather`).
+- DAG topology allows future parallelization of independent nodes.
+
+### 7.2 Provider reliability
+
+**Risk:** Provider internal errors, media fetch restrictions, or edit API unavailability.
+
+**Mitigation:**
+- Executor retry middleware (configurable `retry_attempts`).
+- Timeout middleware (configurable `tool_timeout_seconds`).
+- Explicit `ToolError` propagation with stage-specific error codes.
+- Model fallback strategy per editing case (see Section 5.3).
+
+### 7.3 Clarification loop quality
+
+**Risk:** Ambiguous inputs can trigger repeated clarification turns.
+
+**Mitigation:**
+- Max clarification rounds enforced (`max_clarification_rounds = 2`).
+- Targeted clarification questions from LLM with deterministic fallback.
+- Session state reuse across clarification turns.
+
+### 7.4 Edit quality
+
+**Risk:** Over-editing outside target area (Case 2), mask quality issues (Case 1), crop-to-mask conversion errors (Case 3).
+
+**Mitigation:**
+- Model selection strategy per case (see Section 5.3).
+- Preservation instruction injection for Case 2.
+- SAM-based mask validation for Case 3.
+- Trace metadata capture for quality diagnostics.
+
+### 7.5 Planner reliability
+
+**Risk:** LLM-based planner may produce malformed or semantically invalid DAG plans.
+
+**Mitigation:**
+- DAGValidator structural validation (cycle detection, dependency resolution).
+- Semantic guard validation (required nodes, input path verification).
+- Auto-repair attempt on malformed output.
+- Deterministic template fallback when all LLM attempts fail.
+- Convention enforcement layer (`_enforce_logo_conventions`).
+
+### 7.6 Open technical decisions
+
+- SAM model deployment strategy for Case 1 (FE ONNX) and Case 3 (BE inference).
+- Default editing model selection (Case 2) — gemini-2.5-flash vs gpt-image-1.5.
+- Multi-candidate ranking before edit output.
+- Acceptable cost/request threshold for editing.
+- Session store persistence strategy (current `dict` → Redis/DB).
+- Production BFF transport controls and stream resilience policy.
+- Queue/service decoupling roadmap for heavy generation nodes.
+- Cost tracking/reporting by task_id and session_id.
+- Asset URL TTL and retention policies.
+- Whether mask should be mandatory for small or dense typography edits.
+
+---
+
+## 8. Rollout recommendation
+
+- **Phase 1:** Ship generate flow + Case 2 (image+prompt) editing to collect fast feedback.
+- **Phase 2:** Add Case 1 mask-assisted inpainting for high-precision edits.
+- **Phase 3:** Add Case 3 crop-to-mask conversion and model auto-routing.
+- **Phase 4:** Optimize multi-candidate ranking, cost analytics, and production infrastructure.
 
 ---
 
 ## 9. References
 
-- `source_v2/README.md`
-- `source_v2/agents/logo_creator_agent.py`
-- `source_v2/agents/runner.py`
-- `source_v2/planner/planner_tool.py`
-- `source_v2/planner/planner_templates.py`
-- `source_v2/planner/dag_validator.py`
-- `source_v2/executors/tool_executor.py`
-- `source_v2/executors/input_resolver.py`
-- `source_v2/schemas/plan.py`
-- `source_v2/schemas/runtime_state.py`
-- `source_v2/schemas/tool_io.py`
-- `source_v2/tools/logo_generate_tool.py`
-- `source_v2/tools/web_research_tool.py`
-- `image-editing-phase-template.en.md`
+### 9.1 Source code (source_v2)
+
+| Module | Path |
+|:---|:---|
+| Package root | `source_v2/__init__.py` |
+| Configuration | `source_v2/config.py` |
+| README | `source_v2/README.md` |
+
+**Agents:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/agents/base.py` | `BaseRunner` abstract contract |
+| `source_v2/agents/runner.py` | `Runner` — iterative DAG execution with clarification pause |
+| `source_v2/agents/logo_creator_agent.py` | `LogoCreatorAgent` — high-level facade |
+
+**Planner:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/planner/base.py` | `BasePlanner` abstract contract |
+| `source_v2/planner/planner_tool.py` | `PlannerTool` — LLM-based DAG planner |
+| `source_v2/planner/planner_templates.py` | Deterministic DAG templates |
+| `source_v2/planner/dag_models.py` | Re-export of DAGNode, DAGPlan, PlanningMode |
+| `source_v2/planner/dag_validator.py` | `DAGValidator` — cycle/dependency validation |
+
+**Executors:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/executors/base.py` | `BaseToolExecutor` abstract contract |
+| `source_v2/executors/tool_executor.py` | `ToolExecutor` — timeout, retry, topological execution |
+| `source_v2/executors/input_resolver.py` | `InputResolver` — `${...}` placeholder resolution |
+| `source_v2/executors/validator.py` | `ExecutionValidator` — clarification pause decision |
+| `source_v2/executors/result.py` | Re-export of ToolError, ToolResult |
+
+**Schemas:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/schemas/plan.py` | DAGPlan, DAGNode, PlanningMode |
+| `source_v2/schemas/runtime_state.py` | RuntimeState |
+| `source_v2/schemas/tool_context.py` | ToolContext, build_tool_contexts |
+| `source_v2/schemas/tool_io.py` | ToolResult, ToolError, LargePayloadRef, ArtifactKind |
+
+**Tools:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/tools/base_tool.py` | `V2BaseTool` — base tool with output validation |
+| `source_v2/tools/registry.py` | `ToolRegistry` — in-memory tool registration |
+| `source_v2/tools/intent_detect_tool.py` | Intent detection |
+| `source_v2/tools/input_extract_tool.py` | Brand context extraction |
+| `source_v2/tools/reference_analyze_tool.py` | Reference image analysis |
+| `source_v2/tools/clarification_gate_tool.py` | Required-field gate |
+| `source_v2/tools/clarification_tool.py` | Clarification question generation |
+| `source_v2/tools/web_research_tool.py` | Web research collection |
+| `source_v2/tools/researcher_tool.py` | High-level research wrapper |
+| `source_v2/tools/guideline_generate_tool.py` | Design guideline generation |
+| `source_v2/tools/logo_generate_tool.py` | Logo option generation |
+| `source_v2/tools/tool_search_tool.py` | Tool search by keyword |
+
+### 9.2 Design references
+
+- Image editing phase template: `image-editing-phase-template.en.md`
+- Root SDK overview: `README.md`
